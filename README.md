@@ -30,3 +30,4 @@ Shares `~/.config/run-ollama/settings.db` with `run-ollama.sh`.
 test
 test2
 test3
+test4

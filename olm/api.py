@@ -6,9 +6,33 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 from typing import Optional
+import re
 
 LOGFILE = "/tmp/ollama-serve.log"
 PIDFILE = "/tmp/ollama-serve.pid"
+
+
+def _sysmem() -> tuple[Optional[int], Optional[int], Optional[int]]:
+    """Return (total_bytes, used_bytes, free_bytes) matching Activity Monitor."""
+    try:
+        total = int(subprocess.check_output(["sysctl", "-n", "hw.memsize"]).strip())
+    except Exception:
+        return None, None, None
+    try:
+        vm = subprocess.check_output(["vm_stat"]).decode()
+    except Exception:
+        return total, None, None
+    pg = 4096
+    m = re.search(r"page size of (\d+)", vm)
+    if m:
+        pg = int(m.group(1))
+
+    def pages(name: str) -> int:
+        mm = re.search(re.escape(name) + r":\s+(\d+)\.", vm)
+        return int(mm.group(1)) * pg if mm else 0
+
+    used = pages("Pages active") + pages("Pages wired down") + pages("Pages occupied by compressor")
+    return total, used, total - used
 
 
 class OllamaClient:
@@ -104,6 +128,20 @@ class OllamaClient:
     def unload(self, model: str) -> bool:
         d = self._post("/api/generate", {"model": model, "keep_alive": 0}, timeout=30)
         return d is not None
+
+    def delete(self, model: str) -> bool:
+        """從磁碟刪除模型（DELETE /api/delete）。"""
+        try:
+            req = urllib.request.Request(
+                self.base_url + "/api/delete",
+                data=json.dumps({"model": model}).encode(),
+                headers={"Content-Type": "application/json"},
+                method="DELETE",
+            )
+            with urllib.request.urlopen(req, timeout=30):
+                return True
+        except Exception:
+            return False
 
     def bench(self, model: str, prompt: str = "Count from 1 to 20.") -> Optional[dict]:
         return self._post(

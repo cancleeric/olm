@@ -1,6 +1,5 @@
 """Interactive dashboard / menu mode for olm."""
 import os
-import re
 import subprocess
 from typing import Optional
 
@@ -10,7 +9,7 @@ from rich.table import Table
 from rich import box
 
 from . import __version__
-from .api import OllamaClient, LOGFILE
+from .api import OllamaClient, LOGFILE, _sysmem
 from .db import Settings, parse_ctx, fmt_ctx
 
 console = Console()
@@ -18,29 +17,6 @@ console = Console()
 
 def _gb(b: int) -> float:
     return b / 1e9
-
-
-def _sysmem() -> tuple[Optional[int], Optional[int], Optional[int]]:
-    """Return (total_bytes, used_bytes, free_bytes) matching Activity Monitor."""
-    try:
-        total = int(subprocess.check_output(["sysctl", "-n", "hw.memsize"]).strip())
-    except Exception:
-        return None, None, None
-    try:
-        vm = subprocess.check_output(["vm_stat"]).decode()
-    except Exception:
-        return total, None, None
-    pg = 4096
-    m = re.search(r"page size of (\d+)", vm)
-    if m:
-        pg = int(m.group(1))
-
-    def pages(name: str) -> int:
-        mm = re.search(re.escape(name) + r":\s+(\d+)\.", vm)
-        return int(mm.group(1)) * pg if mm else 0
-
-    used = pages("Pages active") + pages("Pages wired down") + pages("Pages occupied by compressor")
-    return total, used, total - used
 
 
 def _pick(prompt: str, options: list[str], default: str = "") -> str:
@@ -169,6 +145,7 @@ def _render_dashboard(client: OllamaClient, settings: Settings):
         ("8", "Show model info", "查模型詳細資訊"),
         ("9", "Logs", "查背景服務日誌"),
         ("0", "Benchmark", "測試 tok/s 推論速度"),
+        ("d", "Delete model", "從磁碟刪除模型"),
         ("s", "Settings", "調整設定（存 SQLite）"),
         ("r", "Refresh", "重新整理"),
         ("q", "Quit", "離開"),
@@ -342,8 +319,17 @@ def run_dashboard(client: OllamaClient, settings: Settings):
                 if not running:
                     console.print("[red]✗ 服務未啟動[/red]")
                 else:
-                    names = [m["name"] for m in client.list_models()]
+                    models_list = client.list_models()
+                    names = [m["name"] for m in models_list]
                     model = _pick("載入哪個模型", names, settings.default_model)
+                    minfo = next((mo for mo in models_list if mo["name"] == model), {})
+                    model_sz = minfo.get("size", 0)
+                    _, _, free_b = _sysmem()
+                    if free_b is not None and model_sz and free_b < model_sz + 2_000_000_000:
+                        console.print(
+                            f"[yellow]⚠ RAM 可能不足：可用 {free_b/1e9:.1f} GB，"
+                            f"模型約 {model_sz/1e9:.1f} GB（建議保留 2 GB 餘裕）[/yellow]"
+                        )
                     ctx = settings.effective_ctx(model)
                     console.print(f"[cyan]▶ 載入 {model}  ctx={fmt_ctx(ctx)}[/cyan]")
                     ok = client.load(model, ctx, settings.keep_alive)
@@ -403,6 +389,27 @@ def run_dashboard(client: OllamaClient, settings: Settings):
             elif action == "s":
                 _settings_menu(client, settings)
                 continue
+
+            elif action == "d":
+                if not running:
+                    console.print("[red]✗ 服務未啟動[/red]")
+                else:
+                    names = [m["name"] for m in client.list_models()]
+                    if not names:
+                        console.print("[yellow]⚠ 無已安裝的模型[/yellow]")
+                    else:
+                        model = _pick("刪除哪個模型", names, "")
+                        if model:
+                            confirm = input(f"  確定刪除 {model}？[y/N] ").strip().lower()
+                            if confirm == "y":
+                                ok = client.delete(model)
+                                if ok:
+                                    console.print(f"[green]✓ {model} 已刪除[/green]")
+                                    client.clear_ctx_cache()
+                                else:
+                                    console.print("[red]✗ 刪除失敗[/red]")
+                            else:
+                                console.print("[yellow]已取消[/yellow]")
 
             else:
                 console.print(f"[red]✗ 無效選擇: {action}[/red]")

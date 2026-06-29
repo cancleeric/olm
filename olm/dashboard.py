@@ -9,6 +9,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich import box
 
+from . import __version__
 from .api import OllamaClient, LOGFILE
 from .db import Settings, parse_ctx, fmt_ctx
 
@@ -93,7 +94,7 @@ def _render_dashboard(client: OllamaClient, settings: Settings):
         else:
             lines.append(f"ram: total={_gb(total_b):.1f} GB")
 
-    console.print(Panel("\n".join(lines), title="[green bold]Ollama Dashboard[/]", border_style="green"))
+    console.print(Panel("\n".join(lines), title=f"[green bold]Ollama Dashboard v{__version__}[/]", border_style="green"))
 
     # ── Loaded Models ─────────────────────────────────────────
     loaded = client.list_loaded() if running else []

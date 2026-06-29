@@ -16,6 +16,7 @@ class OllamaClient:
         port = os.environ.get("OLLAMA_PORT", "11434")
         host = os.environ.get("OLLAMA_HOST", f"http://localhost:{port}")
         self.base_url = (base_url or host).rstrip("/")
+        self._ctx_cache: dict[str, int] = {}
 
     def _get(self, path: str, timeout: int = 5) -> Optional[dict]:
         try:
@@ -51,6 +52,14 @@ class OllamaClient:
         return self._post("/api/show", {"model": model}, timeout=10)
 
     def model_max_ctx(self, model: str) -> Optional[int]:
+        if model in self._ctx_cache:
+            return self._ctx_cache[model]
+        result = self._fetch_max_ctx(model)
+        if result is not None:
+            self._ctx_cache[model] = result
+        return result
+
+    def _fetch_max_ctx(self, model: str) -> Optional[int]:
         d = self.show(model)
         if not d:
             return None
@@ -63,6 +72,9 @@ class OllamaClient:
                     v = val
                     break
         return v
+
+    def clear_ctx_cache(self) -> None:
+        self._ctx_cache.clear()
 
     def load(self, model: str, ctx: int, keep_alive: str = "24h") -> bool:
         d = self._post(

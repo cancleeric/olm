@@ -28,3 +28,4 @@ olm config model qwen3.5:9b 128K
 
 Shares `~/.config/run-ollama/settings.db` with `run-ollama.sh`.
 test
+test2

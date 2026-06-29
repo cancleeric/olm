@@ -1,0 +1,17 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "olm"
+version = "0.1.0"
+description = "Ollama model management CLI"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "typer[all]>=0.12",
+    "rich>=13",
+]
+
+[project.scripts]
+olm = "olm.cli:app"

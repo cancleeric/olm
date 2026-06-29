@@ -165,8 +165,14 @@ def cmd_switch(
 # ── run ───────────────────────────────────────────────────────
 @app.command("run", help="互動對話模式")
 def cmd_run(model: Annotated[Optional[str], typer.Argument()] = None):
+    client = _client()
     settings = _settings()
-    m = model or settings.default_model
+    if model is None:
+        running = client.is_running()
+        names = [e["name"] for e in (client.list_models() if running else client.disk_models())]
+        m = _pick("選擇對話模型", names, settings.default_model) if names else settings.default_model
+    else:
+        m = model
     ctx = settings.effective_ctx(m)
     console.print(f"[cyan]▶ 互動模式：[bold]{m}[/bold]  ctx={fmt_ctx(ctx)}[/cyan]")
     env = os.environ.copy()
@@ -230,10 +236,37 @@ def cmd_restart():
 # ── pull ──────────────────────────────────────────────────────
 @app.command("pull", help="下載模型")
 def cmd_pull(model: str):
+    from rich.progress import (
+        Progress, BarColumn, DownloadColumn,
+        TransferSpeedColumn, TimeRemainingColumn, TextColumn,
+    )
     client = _client()
     _require_running(client)
     console.print(f"[cyan]▶ 下載 [bold]{model}[/bold][/cyan]")
-    subprocess.run(["ollama", "pull", model])
+    try:
+        with Progress(
+            TextColumn("[bold cyan]{task.description}"),
+            BarColumn(),
+            DownloadColumn(),
+            TransferSpeedColumn(),
+            TimeRemainingColumn(),
+            console=console,
+            transient=True,
+        ) as progress:
+            task = progress.add_task("pulling manifest", total=None)
+            for chunk in client.pull_stream(model):
+                status = chunk.get("status", "")
+                kwargs: dict = {"description": status}
+                if "total" in chunk:
+                    kwargs["total"] = chunk["total"]
+                    kwargs["completed"] = chunk.get("completed", 0)
+                progress.update(task, **kwargs)
+        console.print(f"[green]✓ {model} 下載完成[/green]")
+        client.clear_ctx_cache()
+    except Exception:
+        console.print("[yellow]▶ 串流異常，改用 subprocess 下載…[/yellow]")
+        subprocess.run(["ollama", "pull", model])
+        client.clear_ctx_cache()
 
 
 # ── info ──────────────────────────────────────────────────────

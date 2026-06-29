@@ -76,6 +76,23 @@ class OllamaClient:
     def clear_ctx_cache(self) -> None:
         self._ctx_cache.clear()
 
+    def pull_stream(self, model: str):
+        """Stream NDJSON from /api/pull, yield each parsed dict."""
+        payload = json.dumps({"model": model, "stream": True}).encode()
+        req = urllib.request.Request(
+            self.base_url + "/api/pull",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=7200) as r:
+            for raw_line in r:
+                line = raw_line.strip()
+                if line:
+                    try:
+                        yield json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+
     def load(self, model: str, ctx: int, keep_alive: str = "24h") -> bool:
         d = self._post(
             "/api/generate",

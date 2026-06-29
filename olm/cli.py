@@ -10,7 +10,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich import box
 
-from .api import OllamaClient, LOGFILE
+from .api import OllamaClient, LOGFILE, _sysmem
 from .db import Settings, parse_ctx, fmt_ctx
 from .dashboard import run_dashboard, _do_bench, _pick
 
@@ -119,6 +119,15 @@ def cmd_load(
     settings = _settings()
     _require_running(client)
     m = model or settings.default_model
+    _, _, free_b = _sysmem()
+    if free_b is not None:
+        minfo = next((mo for mo in client.list_models() if mo["name"] == m), {})
+        model_sz = minfo.get("size", 0)
+        if model_sz and free_b < model_sz + 2_000_000_000:
+            console.print(
+                f"[yellow]⚠ RAM 可能不足：系統可用 {free_b/1e9:.1f} GB，"
+                f"模型約 {model_sz/1e9:.1f} GB（建議保留 2 GB 餘裕）[/yellow]"
+            )
     c = parse_ctx(ctx) if ctx else settings.effective_ctx(m)
     k = keep or settings.keep_alive
     console.print(f"[cyan]▶ 載入 [bold]{m}[/bold]  ctx={fmt_ctx(c)}  keep_alive={k}[/cyan]")
@@ -267,6 +276,36 @@ def cmd_pull(model: str):
         console.print("[yellow]▶ 串流異常，改用 subprocess 下載…[/yellow]")
         subprocess.run(["ollama", "pull", model])
         client.clear_ctx_cache()
+
+
+# ── delete ────────────────────────────────────────────────────
+@app.command("delete", help="從磁碟刪除模型（不可復原）")
+def cmd_delete(
+    model: Annotated[Optional[str], typer.Argument()] = None,
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="跳過確認")] = False,
+):
+    client = _client()
+    _require_running(client)
+    installed = [m["name"] for m in client.list_models()]
+    if not installed:
+        console.print("[yellow]⚠ 無已安裝的模型[/yellow]")
+        return
+    m = model or _pick("刪除哪個模型", installed, "")
+    if not m:
+        return
+    if not yes:
+        confirm = input(f"  確定刪除 {m}？此操作不可復原 [y/N] ").strip().lower()
+        if confirm != "y":
+            console.print("[yellow]已取消[/yellow]")
+            return
+    console.print(f"[red]▶ 刪除 [bold]{m}[/bold][/red]")
+    ok = client.delete(m)
+    if ok:
+        console.print(f"[green]✓ {m} 已刪除[/green]")
+        client.clear_ctx_cache()
+    else:
+        console.print("[red]✗ 刪除失敗（模型不存在或服務異常）[/red]")
+        raise typer.Exit(1)
 
 
 # ── info ──────────────────────────────────────────────────────

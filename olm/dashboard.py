@@ -354,7 +354,10 @@ def run_dashboard(client: OllamaClient, settings: Settings):
                 else:
                     names = [m["name"] for m in client.list_models()]
                     model = _pick("對話哪個模型", names, settings.default_model)
-                    subprocess.run(["ollama", "run", model])
+                    ctx = settings.effective_ctx(model)
+                    env = os.environ.copy()
+                    env["OLLAMA_NUM_CTX"] = str(ctx)
+                    subprocess.run(["ollama", "run", model], env=env)
 
             elif action == "6":
                 if not running:
@@ -363,6 +366,7 @@ def run_dashboard(client: OllamaClient, settings: Settings):
                     model = input("  輸入要下載的模型名稱: ").strip()
                     if model:
                         subprocess.run(["ollama", "pull", model])
+                        client.clear_ctx_cache()
 
             elif action == "7":
                 if not running:

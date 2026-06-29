@@ -167,8 +167,11 @@ def cmd_switch(
 def cmd_run(model: Annotated[Optional[str], typer.Argument()] = None):
     settings = _settings()
     m = model or settings.default_model
-    console.print(f"[cyan]▶ 互動模式：[bold]{m}[/bold][/cyan]")
-    subprocess.run(["ollama", "run", m])
+    ctx = settings.effective_ctx(m)
+    console.print(f"[cyan]▶ 互動模式：[bold]{m}[/bold]  ctx={fmt_ctx(ctx)}[/cyan]")
+    env = os.environ.copy()
+    env["OLLAMA_NUM_CTX"] = str(ctx)
+    subprocess.run(["ollama", "run", m], env=env)
 
 
 # ── start ─────────────────────────────────────────────────────

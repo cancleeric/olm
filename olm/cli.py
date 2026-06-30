@@ -298,7 +298,7 @@ def cmd_switch(
 
 
 # ── run ───────────────────────────────────────────────────────
-@app.command("run", help="互動對話模式")
+@app.command("run", help="原生 ollama REPL（輕量，無 TPS/MCP 功能）")
 def cmd_run(model: Annotated[Optional[str], typer.Argument()] = None):
     client = _client()
     settings = _settings()
@@ -318,7 +318,7 @@ def cmd_run(model: Annotated[Optional[str], typer.Argument()] = None):
 
 
 # ── chat ──────────────────────────────────────────────────────
-@app.command("chat", help="多輪對話（自控 system prompt 與取樣參數）")
+@app.command("chat", help="olm 進階 REPL（TPS bar / ctx bar / MCP / preset / --save）")
 def cmd_chat(
     model: Annotated[Optional[str], typer.Argument()] = None,
     system: Annotated[Optional[str], typer.Option("--system", "-s", help="System prompt")] = None,
@@ -620,6 +620,7 @@ def cmd_search(
     limit: Annotated[int, typer.Option("--limit", "-n", help="最多顯示幾筆")] = 20,
 ):
     from .api import search_models
+    client = _client()
     if not keyword:
         console.print("[yellow]請輸入搜尋關鍵字[/yellow]")
         raise typer.Exit(1)
@@ -650,6 +651,16 @@ def cmd_search(
         )
     console.print(Panel(t, title=f"[green bold]搜尋結果：{keyword}[/]", border_style="green"))
     console.print(f"  [dim]提示：olm pull <model>:<tag> 下載模型[/dim]")
+    if results:
+        try:
+            console.print("\n[dim]輸入編號直接 pull（或 Enter 略過）[/dim]")
+            choice = input("  > ").strip()
+            if choice.isdigit():
+                idx = int(choice) - 1
+                if 0 <= idx < len(results):
+                    _do_pull(client, results[idx]["name"])
+        except (EOFError, KeyboardInterrupt):
+            pass
 
 
 # ── embed ─────────────────────────────────────────────────────

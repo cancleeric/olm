@@ -228,6 +228,7 @@ def _render_dashboard(client: OllamaClient, settings: Settings):
     inst_table.add_column("Model", style="bold")
     inst_table.add_column("Size", justify="right")
     inst_table.add_column("支援 ctx")
+    inst_table.add_column("Q", style="dim", justify="center")
     inst_table.add_column("fits?", justify="center")
 
     hint = " [yellow](讀自磁碟)[/]" if from_disk else ""
@@ -253,7 +254,7 @@ def _render_dashboard(client: OllamaClient, settings: Settings):
                 fits_str = "[yellow]![/yellow]"
             else:
                 fits_str = "[red]✗[/red]"
-            inst_table.add_row(str(i), m["name"], f"{m.get('size', 0) / 1e9:.1f} GB", ctx_col, fits_str)
+            inst_table.add_row(str(i), m["name"], f"{m.get('size', 0) / 1e9:.1f} GB", ctx_col, _quant_label(m["name"]), fits_str)
         console.print(Panel(inst_table, title=f"[green bold]Installed Models[/]{hint}", border_style="green"))
 
     # ── Actions ───────────────────────────────────────────────
@@ -473,6 +474,18 @@ def _fmt_expires(ts: str) -> str:
         return ts[:16]
 
 
+def _quant_label(name: str) -> str:
+    """從模型名稱解析量化等級簡稱。"""
+    import re
+    n = name.lower()
+    if "mlx" in n:
+        return "MLX"
+    m = re.search(r'(q\d+_k_[sml]|q\d+_[0-9]+|fp16|bf16|int4|int8|f32)', n)
+    if m:
+        return m.group(1).upper()
+    return ""
+
+
 def _dash_pull(client: "OllamaClient", model: str) -> None:
     """Dashboard 用的 pull，帶 Rich 進度條。"""
     from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, DownloadColumn, TransferSpeedColumn
@@ -561,7 +574,7 @@ def _do_chat_repl(
         conv_id = settings.create_conversation(save_name, model)
         console.print(f"  [dim]歷史記錄中：#{conv_id} {save_name}[/dim]")
 
-    console.print(f"\n[cyan]▶ 對話：[bold]{model}[/bold]  /bye 離開 · /ctx 調整 context · /clear 清除對話 · /model 切換模型[/cyan]")
+    console.print(f"\n[cyan]▶ 對話：[bold]{model}[/bold]  /bye 離開 · /ctx 調整 context · /clear 清除對話 · /model 切換模型 · /temp 取樣溫度 · /system 更新提示 · /save 儲存[/cyan]")
     if fmt:
         console.print(f"  [dim]輸出格式：{fmt}[/dim]")
     if options:
@@ -618,6 +631,24 @@ def _do_chat_repl(
             else:
                 console.print(f"  [dim]目前 ctx_limit = {ctx_limit:,}[/dim]  用法：/ctx 32768 或 /ctx 128K")
             continue
+        if user_input.startswith("/temp"):
+            parts_t = user_input.split(None, 1)
+            if len(parts_t) == 2:
+                try:
+                    val = float(parts_t[1])
+                    if 0.0 <= val <= 2.0:
+                        if options is None:
+                            options = {}
+                        options["temperature"] = val
+                        console.print(f"[green]✓ temperature = {val}[/green]")
+                    else:
+                        console.print("[red]範圍：0.0 ~ 2.0[/red]")
+                except ValueError:
+                    console.print("[red]格式：/temp 0.7[/red]")
+            else:
+                cur = options.get("temperature", "（未設定）") if options else "（未設定）"
+                console.print(f"  temperature = {cur}  用法：/temp 0.7")
+            continue
         if user_input.strip() == "/clear":
             messages.clear()
             if system:
@@ -636,10 +667,48 @@ def _do_chat_repl(
                 console.print(f"[green]✓ 已切換：{model}（對話已清除）[/green]")
             else:
                 all_models = [m["name"] for m in client.list_models()]
-                console.print(f"  目前：[bold]{model}[/bold]")
-                for i, m in enumerate(all_models, 1):
-                    console.print(f"  {i}) {m}")
-                console.print("  用法：/model qwen2.5:7b")
+                if all_models:
+                    picked = _pick("切換模型", all_models, model)
+                    if picked and picked != model:
+                        messages.clear()
+                        if system:
+                            messages.append({"role": "system", "content": system})
+                        model = picked
+                        ctx_limit = client.model_max_ctx(model) or 0
+                        console.print(f"[green]✓ 已切換：{model}（對話已清除）[/green]")
+                else:
+                    console.print("  [dim]無可用模型[/dim]")
+            continue
+        if user_input.startswith("/system"):
+            parts_sys = user_input.split(None, 1)
+            if len(parts_sys) == 2:
+                new_system = parts_sys[1].strip()
+            else:
+                console.print("  [dim]輸入新的 system prompt，Ctrl-D 結束：[/dim]")
+                lines = []
+                try:
+                    while True:
+                        lines.append(input())
+                except EOFError:
+                    pass
+                new_system = "\n".join(lines).strip()
+            if new_system:
+                messages[:] = [m for m in messages if m["role"] != "system"]
+                messages.insert(0, {"role": "system", "content": new_system})
+                system = new_system
+                console.print("[green]✓ System prompt 已更新[/green]")
+            continue
+        if user_input.startswith("/save"):
+            parts_s = user_input.split(None, 1)
+            save_label = parts_s[1].strip() if len(parts_s) == 2 else f"{model}-saved"
+            if conv_id is None:
+                conv_id = settings.create_conversation(save_label, model)
+                for msg in messages:
+                    if msg["role"] != "system":
+                        settings.add_message(conv_id, msg["role"], msg["content"])
+                console.print(f"[green]✓ 已建立記錄：#{conv_id} {save_label}[/green]")
+            else:
+                console.print(f"[dim]已在記錄中：#{conv_id}（後續訊息自動儲存）[/dim]")
             continue
         if user_input.lower() in ("exit", "/bye"):
             console.print("[yellow]再見[/yellow]")
@@ -1002,8 +1071,17 @@ def run_dashboard(client: OllamaClient, settings: Settings):
 
             elif action == "6":
                 if not running:
-                    console.print("[red]✗ 服務未啟動[/red]")
-                else:
+                    console.print("[yellow]⚠ Ollama 未啟動[/yellow]")
+                    start_ans = input("  是否立即啟動？[y/N] ").strip().lower()
+                    if start_ans in ("y", "yes"):
+                        client.start_server(settings.ollama_port, settings.num_ctx, settings.keep_alive)
+                        if _wait_ollama(client, timeout=20):
+                            running = True
+                            console.print("[green]✓ Ollama 已就緒[/green]")
+                        else:
+                            console.print("[red]✗ 啟動失敗，請查 olm logs[/red]")
+                if running:
+                    console.print("[dim]（不知道模型名稱？先按 f 搜尋 Ollama 模型庫）[/dim]")
                     model = input("  輸入要下載的模型名稱: ").strip()
                     if model:
                         _dash_pull(client, model)

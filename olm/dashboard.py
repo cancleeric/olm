@@ -821,7 +821,16 @@ def run_dashboard(client: OllamaClient, settings: Settings):
                             f"[yellow]⚠ RAM 可能不足：可用 {free_b/1e9:.1f} GB，"
                             f"模型約 {model_sz/1e9:.1f} GB（建議保留 2 GB 餘裕）[/yellow]"
                         )
-                    ctx = settings.effective_ctx(model)
+                    cur_ctx = settings.effective_ctx(model)
+                    console.print(f"  [dim]Context：{cur_ctx:,} tokens  （Enter 維持，[bold]c[/bold] 開啟調整器）[/dim]")
+                    ans = input("  > ").strip().lower()
+                    num_ctx_override = None
+                    if ans == "c":
+                        picked = _ctx_picker(cur_ctx, model, _free_ram_gb())
+                        if picked:
+                            num_ctx_override = picked
+                            console.print(f"  [green]✓ 此次 context：{picked:,} tokens[/green]")
+                    ctx = num_ctx_override or cur_ctx
                     console.print(f"[cyan]▶ 載入 {model}  ctx={fmt_ctx(ctx)}[/cyan]")
                     ok = client.load(model, ctx, settings.keep_alive)
                     console.print(f"[{'green' if ok else 'red'}]{'✓ 已就緒' if ok else '✗ 載入失敗'}[/]")
@@ -832,8 +841,18 @@ def run_dashboard(client: OllamaClient, settings: Settings):
                 else:
                     names = [m["name"] for m in client.list_models()]
                     model = _pick("對話哪個模型", names, settings.default_model)
+                    cur_ctx = settings.effective_ctx(model)
+                    console.print(f"  [dim]Context：{cur_ctx:,} tokens  （Enter 維持，[bold]c[/bold] 開啟調整器）[/dim]")
+                    ans = input("  > ").strip().lower()
+                    num_ctx_override = None
+                    if ans == "c":
+                        picked = _ctx_picker(cur_ctx, model, _free_ram_gb())
+                        if picked:
+                            num_ctx_override = picked
+                            console.print(f"  [green]✓ 此次 context：{picked:,} tokens[/green]")
                     sys_prompt = input("  System prompt（留空略過）: ").strip() or None
-                    _do_chat_repl(client, settings, model, system=sys_prompt)
+                    _do_chat_repl(client, settings, model, system=sys_prompt,
+                                  options={"num_ctx": num_ctx_override or cur_ctx})
 
             elif action == "6":
                 if not running:

@@ -19,6 +19,13 @@ def _gb(b: int) -> float:
     return b / 1e9
 
 
+def _vram_str(size_vram: int) -> str:
+    """size_vram bytes → 顯示字串；0 或缺值顯示 '-'。"""
+    if not size_vram:
+        return "-"
+    return f"{size_vram / 1e9:.1f} GB"
+
+
 def _pick(prompt: str, options: list[str], default: str = "") -> str:
     """Simple numbered picker. Returns selected value."""
     if not options:
@@ -77,6 +84,7 @@ def _render_dashboard(client: OllamaClient, settings: Settings):
     loaded_table = Table(box=box.SIMPLE, show_header=True, header_style="green bold")
     loaded_table.add_column("Model", style="bold")
     loaded_table.add_column("RAM", justify="right")
+    loaded_table.add_column("VRAM", justify="right")
     loaded_table.add_column("ctx(actual/max)")
     loaded_table.add_column("expires")
 
@@ -84,9 +92,12 @@ def _render_dashboard(client: OllamaClient, settings: Settings):
         console.print(Panel("（無）", title="[green bold]Loaded Models[/]", border_style="dim"))
     else:
         loaded_total = 0
+        loaded_vram_total = 0
         for m in loaded:
             sz = m.get("size", 0)
+            sv = m.get("size_vram", 0)
             loaded_total += sz
+            loaded_vram_total += sv
             actual = m.get("context_length")
             mx = client.model_max_ctx(m["name"])
             ctx_str = f"{fmt_ctx(actual)}/{fmt_ctx(mx)}"
@@ -96,13 +107,16 @@ def _render_dashboard(client: OllamaClient, settings: Settings):
             loaded_table.add_row(
                 m["name"],
                 f"{_gb(sz):.1f} GB",
+                _vram_str(sv),
                 ctx_str + warn,
                 m.get("expires_at", "?")[:19],
             )
         loaded_table.add_section()
         loaded_table.add_row(
             f"[dim]total ({len(loaded)} models)[/]",
-            f"[bold]{_gb(loaded_total):.1f} GB[/]", "", "",
+            f"[bold]{_gb(loaded_total):.1f} GB[/]",
+            f"[bold]{_vram_str(loaded_vram_total)}[/]",
+            "", "",
         )
         console.print(Panel(loaded_table, title="[green bold]Loaded Models[/]", border_style="green"))
 
@@ -173,6 +187,67 @@ def _do_bench(client: OllamaClient, settings: Settings, model: str):
     console.print(f"  prompt_eval : {pc} tokens, {pd_ns/1e9:.3f}s → {pr_tps:.1f} tok/s")
     console.print(f"  generation  : {ec} tokens, {ed/1e9:.3f}s → [green bold]{gen_tps:.1f} tok/s[/green bold]")
     console.print(f"  total       : {td/1e9:.3f}s")
+
+
+def _do_chat_repl(
+    client: OllamaClient,
+    settings: Settings,
+    model: str,
+    system: Optional[str] = None,
+    options: Optional[dict] = None,
+    no_stream: bool = False,
+) -> None:
+    """多輪對話 REPL。輸入 exit / /bye 或 Ctrl-D 結束。"""
+    messages: list[dict] = []
+    if system:
+        messages.append({"role": "system", "content": system})
+
+    console.print(f"\n[cyan]▶ 對話：[bold]{model}[/bold]  exit 或 /bye 離開，Ctrl-D 結束[/cyan]")
+    if options:
+        console.print(f"  [dim]取樣參數：{options}[/dim]")
+    if system:
+        console.print(f"  [dim]system：{system[:80]}{'…' if len(system) > 80 else ''}[/dim]")
+
+    timeout = settings.chat_timeout
+
+    while True:
+        try:
+            user_input = input("\n[你] ").strip()
+        except (EOFError, KeyboardInterrupt):
+            console.print("\n[yellow]結束對話[/yellow]")
+            break
+        if not user_input:
+            continue
+        if user_input.lower() in ("exit", "/bye"):
+            console.print("[yellow]再見[/yellow]")
+            break
+
+        messages.append({"role": "user", "content": user_input})
+
+        try:
+            # 兩種模式都走 chat_stream，差別只在是否即時輸出
+            full_content = ""
+            if not no_stream:
+                console.print("\n[bold green][AI][/bold green] ", end="", highlight=False)
+            for chunk in client.chat_stream(model, messages, options=options, timeout=timeout):
+                if chunk.get("done"):
+                    break
+                content = chunk.get("message", {}).get("content", "")
+                if content:
+                    full_content += content
+                    if not no_stream:
+                        print(content, end="", flush=True)
+            if no_stream:
+                # --no-stream：等完整再印
+                console.print(f"\n[bold green][AI][/bold green] {full_content}")
+            else:
+                print()  # done 後換行
+        except Exception as e:
+            console.print(f"\n[red]✗ 對話錯誤：{e}[/red]")
+            messages.pop()  # 移除未得到回應的 user message
+            continue
+
+        messages.append({"role": "assistant", "content": full_content})
 
 
 def _settings_menu(client: OllamaClient, settings: Settings):
@@ -341,10 +416,8 @@ def run_dashboard(client: OllamaClient, settings: Settings):
                 else:
                     names = [m["name"] for m in client.list_models()]
                     model = _pick("對話哪個模型", names, settings.default_model)
-                    ctx = settings.effective_ctx(model)
-                    env = os.environ.copy()
-                    env["OLLAMA_NUM_CTX"] = str(ctx)
-                    subprocess.run(["ollama", "run", model], env=env)
+                    sys_prompt = input("  System prompt（留空略過）: ").strip() or None
+                    _do_chat_repl(client, settings, model, system=sys_prompt)
 
             elif action == "6":
                 if not running:

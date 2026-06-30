@@ -204,7 +204,7 @@ def _render_dashboard(client: OllamaClient, settings: Settings):
                 f"{_gb(sz):.1f} GB",
                 _vram_str(sv),
                 ctx_str + warn,
-                m.get("expires_at", "?")[:19],
+                _fmt_expires(m.get("expires_at", "?")),
             )
         loaded_table.add_section()
         loaded_table.add_row(
@@ -451,6 +451,63 @@ def _ctx_picker(current: int, model: str, free_ram_gb: float) -> Optional[int]:
     return None
 
 
+def _fmt_expires(ts: str) -> str:
+    """將 ISO 時間戳轉成 'in 23m' 或 'expired'。"""
+    if not ts or ts == "?":
+        return "?"
+    try:
+        import datetime
+        ts_clean = ts.replace("Z", "+00:00")
+        exp = datetime.datetime.fromisoformat(ts_clean)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        diff = exp - now
+        secs = int(diff.total_seconds())
+        if secs < 0:
+            return "[dim]expired[/dim]"
+        if secs < 60:
+            return f"in {secs}s"
+        if secs < 3600:
+            return f"in {secs//60}m"
+        return f"in {secs//3600}h{(secs%3600)//60}m"
+    except Exception:
+        return ts[:16]
+
+
+def _dash_pull(client: "OllamaClient", model: str) -> None:
+    """Dashboard 用的 pull，帶 Rich 進度條。"""
+    from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, DownloadColumn, TransferSpeedColumn
+    last_status = ""
+    try:
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("{task.description}"),
+            BarColumn(),
+            DownloadColumn(),
+            TransferSpeedColumn(),
+            transient=True,
+        ) as prog:
+            task = prog.add_task(f"下載 {model}", total=None)
+            for chunk in client.pull_stream(model):
+                status = chunk.get("status", "")
+                total = chunk.get("total")
+                completed = chunk.get("completed", 0)
+                if total and prog.tasks[task].total != total:
+                    prog.update(task, total=total)
+                if completed:
+                    prog.update(task, completed=completed, description=status or last_status)
+                if status:
+                    last_status = status
+                if chunk.get("status") == "success":
+                    break
+        console.print(f"[green]✓ 下載完成：{model}[/green]")
+        client.clear_ctx_cache()
+    except Exception:
+        console.print("[yellow]▶ 串流異常，改用 subprocess 下載…[/yellow]")
+        import subprocess as _sp
+        _sp.run(["ollama", "pull", model])
+        client.clear_ctx_cache()
+
+
 def _wait_ollama(client: "OllamaClient", timeout: int = 20) -> bool:
     """等候 Ollama 就緒，顯示 spinner + 倒計時。回傳 True=成功。"""
     import time
@@ -504,7 +561,7 @@ def _do_chat_repl(
         conv_id = settings.create_conversation(save_name, model)
         console.print(f"  [dim]歷史記錄中：#{conv_id} {save_name}[/dim]")
 
-    console.print(f"\n[cyan]▶ 對話：[bold]{model}[/bold]  exit 或 /bye 離開 · /ctx 32768 動態調整 context · Ctrl-D 結束[/cyan]")
+    console.print(f"\n[cyan]▶ 對話：[bold]{model}[/bold]  /bye 離開 · /ctx 調整 context · /clear 清除對話 · /model 切換模型[/cyan]")
     if fmt:
         console.print(f"  [dim]輸出格式：{fmt}[/dim]")
     if options:
@@ -560,6 +617,29 @@ def _do_chat_repl(
                     console.print("  [red]格式錯誤，例：/ctx 32768 或 /ctx 128K[/red]")
             else:
                 console.print(f"  [dim]目前 ctx_limit = {ctx_limit:,}[/dim]  用法：/ctx 32768 或 /ctx 128K")
+            continue
+        if user_input.strip() == "/clear":
+            messages.clear()
+            if system:
+                messages.append({"role": "system", "content": system})
+            console.print("[yellow]✓ 對話已清除（system prompt 保留）[/yellow]")
+            continue
+        if user_input.startswith("/model"):
+            parts = user_input.split(None, 1)
+            if len(parts) == 2:
+                new_model = parts[1].strip()
+                messages.clear()
+                if system:
+                    messages.append({"role": "system", "content": system})
+                model = new_model
+                ctx_limit = client.model_max_ctx(model) or 0
+                console.print(f"[green]✓ 已切換：{model}（對話已清除）[/green]")
+            else:
+                all_models = [m["name"] for m in client.list_models()]
+                console.print(f"  目前：[bold]{model}[/bold]")
+                for i, m in enumerate(all_models, 1):
+                    console.print(f"  {i}) {m}")
+                console.print("  用法：/model qwen2.5:7b")
             continue
         if user_input.lower() in ("exit", "/bye"):
             console.print("[yellow]再見[/yellow]")
@@ -638,7 +718,10 @@ def _do_chat_repl(
                     if ctx_limit:
                         pct = used_ctx / ctx_limit * 100
                         color = "red" if pct > 80 else "yellow" if pct > 60 else "dim"
-                        console.print(f"  [{color}]ctx: {used_ctx} / {ctx_limit} ({pct:.0f}%)[/{color}]")
+                        bar_len = 10
+                        filled = int(pct / 100 * bar_len)
+                        bar = "█" * filled + "░" * (bar_len - filled)
+                        console.print(f"  [{color}][{bar}] {pct:.0f}%  {used_ctx:,}/{ctx_limit:,}[/{color}]")
                     else:
                         console.print(f"  [dim]ctx: {used_ctx} tokens[/dim]")
 
@@ -857,28 +940,32 @@ def run_dashboard(client: OllamaClient, settings: Settings):
                 if running:
                     models_list = client.list_models()
                     names = [m["name"] for m in models_list]
-                    model = _pick("載入哪個模型", names, settings.default_model)
-                    minfo = next((mo for mo in models_list if mo["name"] == model), {})
-                    model_sz = minfo.get("size", 0)
-                    _, _, free_b = _sysmem()
-                    if free_b is not None and model_sz and free_b < model_sz + 2_000_000_000:
-                        console.print(
-                            f"[yellow]⚠ RAM 可能不足：可用 {free_b/1e9:.1f} GB，"
-                            f"模型約 {model_sz/1e9:.1f} GB（建議保留 2 GB 餘裕）[/yellow]"
-                        )
-                    cur_ctx = settings.effective_ctx(model)
-                    console.print(f"  [dim]Context：{cur_ctx:,} tokens  （Enter 維持，[bold]c[/bold] 開啟調整器）[/dim]")
-                    ans = input("  > ").strip().lower()
-                    num_ctx_override = None
-                    if ans == "c":
-                        picked = _ctx_picker(cur_ctx, model, _free_ram_gb())
-                        if picked:
-                            num_ctx_override = picked
-                            console.print(f"  [green]✓ 此次 context：{picked:,} tokens[/green]")
-                    ctx = num_ctx_override or cur_ctx
-                    console.print(f"[cyan]▶ 載入 {model}  ctx={fmt_ctx(ctx)}[/cyan]")
-                    ok = client.load(model, ctx, settings.keep_alive)
-                    console.print(f"[{'green' if ok else 'red'}]{'✓ 已就緒' if ok else '✗ 載入失敗'}[/]")
+                    if not names:
+                        console.print("[red]✗ 無可用模型，請先 pull[/red]")
+                    else:
+                        default = settings.default_model if settings.default_model in names else names[0]
+                        model = _pick("載入哪個模型", names, default)
+                        minfo = next((mo for mo in models_list if mo["name"] == model), {})
+                        model_sz = minfo.get("size", 0)
+                        _, _, free_b = _sysmem()
+                        if free_b is not None and model_sz and free_b < model_sz + 2_000_000_000:
+                            console.print(
+                                f"[yellow]⚠ RAM 可能不足：可用 {free_b/1e9:.1f} GB，"
+                                f"模型約 {model_sz/1e9:.1f} GB（建議保留 2 GB 餘裕）[/yellow]"
+                            )
+                        cur_ctx = settings.effective_ctx(model)
+                        console.print(f"  [dim]Context：{cur_ctx:,} tokens  （Enter 維持，[bold]c[/bold] 開啟調整器）[/dim]")
+                        ans = input("  > ").strip().lower()
+                        num_ctx_override = None
+                        if ans == "c":
+                            picked = _ctx_picker(cur_ctx, model, _free_ram_gb())
+                            if picked:
+                                num_ctx_override = picked
+                                console.print(f"  [green]✓ 此次 context：{picked:,} tokens[/green]")
+                        ctx = num_ctx_override or cur_ctx
+                        console.print(f"[cyan]▶ 載入 {model}  ctx={fmt_ctx(ctx)}[/cyan]")
+                        ok = client.load(model, ctx, settings.keep_alive)
+                        console.print(f"[{'green' if ok else 'red'}]{'✓ 已就緒' if ok else '✗ 載入失敗'}[/]")
 
             elif action == "5":
                 if not running:
@@ -893,7 +980,13 @@ def run_dashboard(client: OllamaClient, settings: Settings):
                             console.print("[red]✗ 啟動失敗，請查 olm logs[/red]")
                 if running:
                     names = [m["name"] for m in client.list_models()]
-                    model = _pick("對話哪個模型", names, settings.default_model)
+                    if not names:
+                        console.print("[red]✗ 無可用模型，請先 pull[/red]")
+                        running = False  # 跳過後續邏輯
+                    else:
+                        default = settings.default_model if settings.default_model in names else names[0]
+                        model = _pick("對話哪個模型", names, default)
+                if running and names:
                     cur_ctx = settings.effective_ctx(model)
                     console.print(f"  [dim]Context：{cur_ctx:,} tokens  （Enter 維持，[bold]c[/bold] 開啟調整器）[/dim]")
                     ans = input("  > ").strip().lower()
@@ -913,8 +1006,7 @@ def run_dashboard(client: OllamaClient, settings: Settings):
                 else:
                     model = input("  輸入要下載的模型名稱: ").strip()
                     if model:
-                        subprocess.run(["ollama", "pull", model])
-                        client.clear_ctx_cache()
+                        _dash_pull(client, model)
 
             elif action == "7":
                 if not running:
@@ -993,6 +1085,7 @@ def run_dashboard(client: OllamaClient, settings: Settings):
                         if not results:
                             console.print("[yellow]無結果[/yellow]")
                         else:
+                            installed_names = {m["name"].split(":")[0] for m in client.list_models()} if running else set()
                             st = Table(box=box.SIMPLE, show_header=True, header_style="green bold")
                             st.add_column("#", justify="right", style="cyan")
                             st.add_column("Model", style="bold")
@@ -1000,8 +1093,10 @@ def run_dashboard(client: OllamaClient, settings: Settings):
                             st.add_column("Sizes")
                             st.add_column("Description", style="dim", max_width=50)
                             for i, r in enumerate(results[:15], 1):
+                                rname = r["name"]
+                                name_col = rname + (" [green]✓已安裝[/green]" if rname.split(":")[0] in installed_names else "")
                                 st.add_row(
-                                    str(i), r["name"], r["pulls"],
+                                    str(i), name_col, r["pulls"],
                                     " ".join(r["sizes"]) or "-", r["description"][:60],
                                 )
                             console.print(Panel(
@@ -1009,6 +1104,15 @@ def run_dashboard(client: OllamaClient, settings: Settings):
                                 title=f"[green bold]搜尋：{keyword}[/]",
                                 border_style="green",
                             ))
+                            if running:
+                                console.print("\n[dim]輸入編號直接下載，或 Enter 返回[/dim]")
+                                choice = input("  > ").strip()
+                                if choice.isdigit():
+                                    idx = int(choice) - 1
+                                    if 0 <= idx < len(results[:15]):
+                                        model_name = results[idx]["name"]
+                                        console.print(f"[cyan]▶ 下載 {model_name}...[/cyan]")
+                                        _dash_pull(client, model_name)
 
             elif action == "g":
                 acl = settings.gateway_list_allow()

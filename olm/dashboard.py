@@ -162,6 +162,7 @@ def _render_dashboard(client: OllamaClient, settings: Settings):
         ("9", "Logs", "查背景服務日誌"),
         ("0", "Benchmark", "測試 tok/s 推論速度"),
         ("d", "Delete model", "從磁碟刪除模型"),
+        ("f", "Search models", "搜尋 Ollama 模型庫"),
         ("s", "Settings", "調整設定（存 SQLite）"),
         ("r", "Refresh", "重新整理"),
         ("q", "Quit", "離開"),
@@ -198,11 +199,25 @@ def _do_chat_repl(
     system: Optional[str] = None,
     options: Optional[dict] = None,
     no_stream: bool = False,
+    mcp_client=None,
 ) -> None:
-    """多輪對話 REPL。輸入 exit / /bye 或 Ctrl-D 結束。"""
+    """多輪對話 REPL with optional MCP tool-calling。輸入 exit / /bye 或 Ctrl-D 結束。"""
+    import json as _json
+
     messages: list[dict] = []
+    tools: list[dict] = []
+
     if system:
         messages.append({"role": "system", "content": system})
+
+    if mcp_client:
+        try:
+            tools = mcp_client.list_tools()
+            tool_names = ", ".join(t["function"]["name"] for t in tools)
+            console.print(f"  [dim]MCP 工具 ({len(tools)} 個)：{tool_names}[/dim]")
+        except Exception as e:
+            console.print(f"[yellow]MCP 工具載入失敗：{e}[/yellow]")
+            tools = []
 
     console.print(f"\n[cyan]▶ 對話：[bold]{model}[/bold]  exit 或 /bye 離開，Ctrl-D 結束[/cyan]")
     if options:
@@ -226,30 +241,89 @@ def _do_chat_repl(
 
         messages.append({"role": "user", "content": user_input})
 
-        try:
-            # 兩種模式都走 chat_stream，差別只在是否即時輸出
-            full_content = ""
-            if not no_stream:
-                console.print("\n[bold green][AI][/bold green] ", end="", highlight=False)
-            for chunk in client.chat_stream(model, messages, options=options, timeout=timeout):
-                if chunk.get("done"):
-                    break
-                content = chunk.get("message", {}).get("content", "")
-                if content:
-                    full_content += content
-                    if not no_stream:
-                        print(content, end="", flush=True)
-            if no_stream:
-                # --no-stream：等完整再印
-                console.print(f"\n[bold green][AI][/bold green] {full_content}")
-            else:
-                print()  # done 後換行
-        except Exception as e:
-            console.print(f"\n[red]✗ 對話錯誤：{e}[/red]")
-            messages.pop()  # 移除未得到回應的 user message
-            continue
+        # Tool call loop：model 可能連續呼叫多個工具
+        turn_failed = False
+        while True:
+            try:
+                full_content = ""
+                tool_calls: list = []
+                final_msg: dict = {}
 
-        messages.append({"role": "assistant", "content": full_content})
+                if not no_stream:
+                    console.print("\n[bold green][AI][/bold green] ", end="", highlight=False)
+
+                for chunk in client.chat_stream(
+                    model, messages, options=options,
+                    tools=tools if tools else None,
+                    timeout=timeout,
+                ):
+                    msg = chunk.get("message", {})
+                    if chunk.get("done"):
+                        final_msg = msg
+                        break
+                    content = msg.get("content", "")
+                    if content:
+                        full_content += content
+                        if not no_stream:
+                            print(content, end="", flush=True)
+                    # tool_calls 可能在 done=False 的 chunk 中出現
+                    tc = msg.get("tool_calls")
+                    if tc:
+                        tool_calls = tc
+
+                # 也查 done chunk（部分模型放這裡）
+                if not tool_calls:
+                    tool_calls = final_msg.get("tool_calls", [])
+
+                if not no_stream:
+                    print()
+                else:
+                    if full_content:
+                        console.print(f"\n[bold green][AI][/bold green] {full_content}")
+
+                if tool_calls and mcp_client:
+                    # 有工具呼叫，執行後繼續對話
+                    messages.append({
+                        "role": "assistant",
+                        "content": full_content,
+                        "tool_calls": tool_calls,
+                    })
+                    for tc in tool_calls:
+                        fn = tc.get("function", {})
+                        tool_name = fn.get("name", "")
+                        tool_args = fn.get("arguments", {})
+                        if isinstance(tool_args, str):
+                            try:
+                                tool_args = _json.loads(tool_args)
+                            except Exception:
+                                tool_args = {}
+                        console.print(
+                            f"\n[yellow]  {tool_name}"
+                            f"({_json.dumps(tool_args, ensure_ascii=False)})[/yellow]"
+                        )
+                        try:
+                            result = mcp_client.call_tool(tool_name, tool_args)
+                            preview = result[:300] + ("…" if len(result) > 300 else "")
+                            console.print(f"[dim]   -> {preview}[/dim]")
+                        except Exception as e:
+                            result = f"工具呼叫失敗：{e}"
+                            console.print(f"[red]   -> {e}[/red]")
+                        messages.append({"role": "tool", "content": result})
+                    # 繼續迴圈讓 model 處理工具結果
+                    if not no_stream:
+                        console.print("\n[bold green][AI][/bold green] ", end="", highlight=False)
+                else:
+                    # 無工具呼叫，這一輪結束
+                    messages.append({"role": "assistant", "content": full_content})
+                    break
+
+            except Exception as e:
+                console.print(f"\n[red]✗ 對話錯誤：{e}[/red]")
+                turn_failed = True
+                break
+
+        if turn_failed:
+            messages.pop()  # 移除未得到回應的 user message
 
 
 def _settings_menu(client: OllamaClient, settings: Settings):
@@ -501,6 +575,36 @@ def run_dashboard(client: OllamaClient, settings: Settings):
                                     console.print("[red]✗ 刪除失敗[/red]")
                             else:
                                 console.print("[yellow]已取消[/yellow]")
+
+            elif action == "f":
+                keyword = input("  搜尋關鍵字: ").strip()
+                if keyword:
+                    from .api import search_models
+                    console.print(f"[cyan]搜尋：{keyword}[/cyan]")
+                    try:
+                        results = search_models(keyword)
+                    except ConnectionError as e:
+                        console.print(f"[red]{e}[/red]")
+                    else:
+                        if not results:
+                            console.print("[yellow]無結果[/yellow]")
+                        else:
+                            st = Table(box=box.SIMPLE, show_header=True, header_style="green bold")
+                            st.add_column("#", justify="right", style="cyan")
+                            st.add_column("Model", style="bold")
+                            st.add_column("Pulls", justify="right")
+                            st.add_column("Sizes")
+                            st.add_column("Description", style="dim", max_width=50)
+                            for i, r in enumerate(results[:15], 1):
+                                st.add_row(
+                                    str(i), r["name"], r["pulls"],
+                                    " ".join(r["sizes"]) or "-", r["description"][:60],
+                                )
+                            console.print(Panel(
+                                st,
+                                title=f"[green bold]搜尋：{keyword}[/]",
+                                border_style="green",
+                            ))
 
             else:
                 console.print(f"[red]✗ 無效選擇: {action}[/red]")

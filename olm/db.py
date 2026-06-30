@@ -1,4 +1,5 @@
 """SQLite settings persistence — shares ~/.config/run-ollama/settings.db with run-ollama.sh."""
+import json
 import sqlite3
 import os
 from pathlib import Path
@@ -36,6 +37,18 @@ class Settings:
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS model_ctx(model TEXT PRIMARY KEY, num_ctx INTEGER)"
             )
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS presets (
+                    name TEXT PRIMARY KEY,
+                    model TEXT,
+                    system_prompt TEXT,
+                    temperature REAL,
+                    top_p REAL,
+                    top_k INTEGER,
+                    stop_seqs TEXT,
+                    created_at TEXT DEFAULT (datetime('now'))
+                )
+            """)
             for k, v in DEFAULTS.items():
                 conn.execute(
                     "INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (k, v)
@@ -116,6 +129,72 @@ class Settings:
     @property
     def gateway_port(self) -> int:
         return int(self.get("gateway_port"))
+
+    # ── Preset CRUD ───────────────────────────────────────────────────────────
+
+    def save_preset(
+        self,
+        name: str,
+        model: str | None,
+        system_prompt: str | None,
+        temperature: float | None,
+        top_p: float | None,
+        top_k: int | None,
+        stop_seqs: list[str] | None,
+    ):
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO presets"
+                "(name,model,system_prompt,temperature,top_p,top_k,stop_seqs)"
+                " VALUES(?,?,?,?,?,?,?)",
+                (
+                    name, model, system_prompt, temperature, top_p, top_k,
+                    json.dumps(stop_seqs) if stop_seqs else None,
+                ),
+            )
+
+    def get_preset(self, name: str) -> dict | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT name,model,system_prompt,temperature,top_p,top_k,stop_seqs"
+                " FROM presets WHERE name=?",
+                (name,),
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "name": row[0],
+            "model": row[1],
+            "system_prompt": row[2],
+            "temperature": row[3],
+            "top_p": row[4],
+            "top_k": row[5],
+            "stop_seqs": json.loads(row[6]) if row[6] else None,
+        }
+
+    def list_presets(self) -> list[dict]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT name,model,system_prompt,temperature,top_p,top_k,created_at"
+                " FROM presets ORDER BY created_at DESC"
+            ).fetchall()
+        return [
+            {
+                "name": r[0],
+                "model": r[1],
+                "system_prompt": r[2],
+                "temperature": r[3],
+                "top_p": r[4],
+                "top_k": r[5],
+                "created_at": r[6],
+            }
+            for r in rows
+        ]
+
+    def delete_preset(self, name: str) -> bool:
+        with self._conn() as conn:
+            c = conn.execute("DELETE FROM presets WHERE name=?", (name,))
+            return c.rowcount > 0
 
 
 def parse_ctx(s: str) -> int | None:

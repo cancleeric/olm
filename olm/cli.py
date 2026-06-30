@@ -219,10 +219,31 @@ def cmd_chat(
     top_k: Annotated[Optional[int], typer.Option("--top-k", help="top_k 取樣")] = None,
     stop: Annotated[Optional[list[str]], typer.Option("--stop", help="停止序列（可多次）")] = None,
     no_stream: Annotated[bool, typer.Option("--no-stream", help="等完整回應再印")] = False,
+    preset: Annotated[Optional[str], typer.Option("--preset", "-p", help="載入已存 preset")] = None,
+    mcp: Annotated[Optional[str], typer.Option("--mcp", help="MCP server spec（npx:pkg/cmd:exe/python:mod）")] = None,
 ):
     client = _client()
     settings = _settings()
     _require_running(client)
+
+    # 載入 preset（CLI 選項優先）
+    if preset:
+        p = settings.get_preset(preset)
+        if not p:
+            console.print(f"[red]preset '{preset}' 不存在，用 olm preset list 查看[/red]")
+            raise typer.Exit(1)
+        model = model or p.get("model")
+        system = system or p.get("system_prompt")
+        if temp is None and p.get("temperature") is not None:
+            temp = p["temperature"]
+        if top_p is None and p.get("top_p") is not None:
+            top_p = p["top_p"]
+        if top_k is None and p.get("top_k") is not None:
+            top_k = p["top_k"]
+        if not stop and p.get("stop_seqs"):
+            stop = p["stop_seqs"]
+        console.print(f"[dim]已載入 preset：{preset}[/dim]")
+
     m = model or settings.default_model
 
     # 只把「有給的」取樣參數放進 options
@@ -236,12 +257,29 @@ def cmd_chat(
     if stop:
         options["stop"] = list(stop)
 
-    _do_chat_repl(
-        client, settings, m,
-        system=system,
-        options=options or None,
-        no_stream=no_stream,
-    )
+    mcp_client = None
+    if mcp:
+        from .mcp import MCPClient, parse_mcp_spec
+        cmd_args = parse_mcp_spec(mcp)
+        console.print(f"[cyan]啟動 MCP server：{' '.join(cmd_args)}[/cyan]")
+        try:
+            mcp_client = MCPClient(cmd_args)
+            mcp_client.initialize()
+        except Exception as e:
+            console.print(f"[red]MCP 啟動失敗：{e}[/red]")
+            raise typer.Exit(1)
+
+    try:
+        _do_chat_repl(
+            client, settings, m,
+            system=system,
+            options=options or None,
+            no_stream=no_stream,
+            mcp_client=mcp_client,
+        )
+    finally:
+        if mcp_client:
+            mcp_client.close()
 
 
 # ── start ─────────────────────────────────────────────────────
@@ -436,6 +474,77 @@ def cmd_logs(
         subprocess.run(["tail", "-10", GATEWAY_LOGFILE])
 
 
+# ── search ────────────────────────────────────────────────────
+@app.command("search", help="搜尋 Ollama 模型庫（爬 ollama.com/search）")
+def cmd_search(
+    keyword: Annotated[str, typer.Argument(help="搜尋關鍵字")] = "",
+    limit: Annotated[int, typer.Option("--limit", "-n", help="最多顯示幾筆")] = 20,
+):
+    from .api import search_models
+    if not keyword:
+        console.print("[yellow]請輸入搜尋關鍵字[/yellow]")
+        raise typer.Exit(1)
+    console.print(f"[cyan]搜尋 ollama.com：[bold]{keyword}[/bold][/cyan]")
+    try:
+        results = search_models(keyword, limit=limit)
+    except ConnectionError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
+    if not results:
+        console.print("[yellow]無結果（ollama.com 可能已改版，或關鍵字無符合）[/yellow]")
+        return
+    t = Table(box=box.SIMPLE, show_header=True, header_style="green bold")
+    t.add_column("#", justify="right", style="cyan")
+    t.add_column("Model", style="bold")
+    t.add_column("Pulls", justify="right")
+    t.add_column("Tags", justify="right")
+    t.add_column("Sizes")
+    t.add_column("Caps", style="dim")
+    t.add_column("Updated", style="dim")
+    t.add_column("Description", style="dim", no_wrap=False, max_width=40)
+    for i, r in enumerate(results, 1):
+        sizes_str = " ".join(r["sizes"]) or "-"
+        caps_str = " ".join(r["capabilities"]) or "-"
+        t.add_row(
+            str(i), r["name"], r["pulls"], r["tags"],
+            sizes_str, caps_str, r["updated"], r["description"][:80],
+        )
+    console.print(Panel(t, title=f"[green bold]搜尋結果：{keyword}[/]", border_style="green"))
+    console.print(f"  [dim]提示：olm pull <model>:<tag> 下載模型[/dim]")
+
+
+# ── embed ─────────────────────────────────────────────────────
+@app.command("embed", help="測試 embeddings（向量維度/前8值/耗時）")
+def cmd_embed(
+    text: Annotated[str, typer.Argument(help="要嵌入的文字")] = "",
+    model: Annotated[Optional[str], typer.Option("--model", "-m", help="Embedding 模型")] = None,
+):
+    import time as _time
+    client = _client()
+    _require_running(client)
+    if not text:
+        console.print("[yellow]請輸入要嵌入的文字[/yellow]")
+        raise typer.Exit(1)
+    m = model or "nomic-embed-text"
+    console.print(f"[cyan]embed：[bold]{m}[/bold][/cyan]")
+    t0 = _time.monotonic()
+    result = client.embed(text, m)
+    elapsed = _time.monotonic() - t0
+    if not result:
+        console.print("[red]失敗（模型未安裝或服務異常）[/red]")
+        raise typer.Exit(1)
+    embeddings = result.get("embeddings", [])
+    if not embeddings or not embeddings[0]:
+        console.print("[red]回應無嵌入向量[/red]")
+        raise typer.Exit(1)
+    vec = embeddings[0]
+    dim = len(vec)
+    preview = [f"{v:.4f}" for v in vec[:8]]
+    console.print(f"  維度：[bold]{dim}[/bold]")
+    console.print(f"  前8值：[dim]{', '.join(preview)}[/dim]")
+    console.print(f"  耗時：[bold]{elapsed:.3f}s[/bold]")
+
+
 # ── bench ─────────────────────────────────────────────────────
 @app.command("bench", help="測試推論速度（tok/s）")
 def cmd_bench(model: Annotated[Optional[str], typer.Argument()] = None):
@@ -524,3 +633,63 @@ def _config_model(
             raise typer.Exit(1)
         settings.set_model_ctx(name, p)
         console.print(f"[green]✓ {name} ctx = {fmt_ctx(p)}[/green]")
+
+
+# ── preset ────────────────────────────────────────────────────
+_preset_app = typer.Typer(help="對話 preset 儲存/載入")
+app.add_typer(_preset_app, name="preset")
+
+
+@_preset_app.callback(invoke_without_command=True)
+def preset_default(ctx: typer.Context):
+    if ctx.invoked_subcommand is None:
+        _preset_list()
+
+
+@_preset_app.command("save", help="儲存 preset（取樣參數 + system prompt）")
+def _preset_save(
+    name: str,
+    model: Annotated[Optional[str], typer.Option("--model", "-m")] = None,
+    system: Annotated[Optional[str], typer.Option("--system", "-s")] = None,
+    temp: Annotated[Optional[float], typer.Option("--temp")] = None,
+    top_p: Annotated[Optional[float], typer.Option("--top-p")] = None,
+    top_k: Annotated[Optional[int], typer.Option("--top-k")] = None,
+    stop: Annotated[Optional[list[str]], typer.Option("--stop")] = None,
+):
+    settings = _settings()
+    settings.save_preset(name, model, system, temp, top_p, top_k, list(stop) if stop else None)
+    console.print(f"[green]✓ preset [bold]{name}[/bold] 已儲存[/green]")
+
+
+@_preset_app.command("list", help="列出所有 preset")
+def _preset_list():
+    settings = _settings()
+    presets = settings.list_presets()
+    if not presets:
+        console.print("[yellow]（無 preset）[/yellow]  提示：olm preset save <name> --system '...' --temp 0.7")
+        return
+    t = Table(box=box.SIMPLE, show_header=True, header_style="green bold")
+    t.add_column("Name", style="bold")
+    t.add_column("Model")
+    t.add_column("temp", justify="right")
+    t.add_column("top_p", justify="right")
+    t.add_column("top_k", justify="right")
+    t.add_column("System", style="dim", max_width=40)
+    t.add_column("Created")
+    for p in presets:
+        t.add_row(
+            p["name"], p["model"] or "-", str(p["temperature"] or "-"),
+            str(p["top_p"] or "-"), str(p["top_k"] or "-"),
+            (p["system_prompt"] or "-")[:40], (p["created_at"] or "")[:16],
+        )
+    console.print(Panel(t, title="[green bold]Presets[/]", border_style="green"))
+
+
+@_preset_app.command("delete", help="刪除 preset")
+def _preset_delete(name: str):
+    settings = _settings()
+    if settings.delete_preset(name):
+        console.print(f"[green]✓ preset [bold]{name}[/bold] 已刪除[/green]")
+    else:
+        console.print(f"[red]✗ preset '{name}' 不存在[/red]")
+        raise typer.Exit(1)

@@ -129,17 +129,21 @@ class OllamaClient:
         options: dict | None = None,
         keep_alive: str = "24h",
         timeout: int = 21600,
+        tools: list[dict] | None = None,
     ):
         """串流 /api/chat NDJSON，每次 yield 一個 chunk dict。
         容錯：空行跳過、JSONDecodeError 跳過；連線/逾時錯誤向上拋。
         """
-        payload = json.dumps({
+        payload_dict: dict = {
             "model": model,
             "messages": messages,
             "stream": True,
             "keep_alive": keep_alive,
             "options": options or {},
-        }).encode()
+        }
+        if tools:
+            payload_dict["tools"] = tools
+        payload = json.dumps(payload_dict).encode()
         req = urllib.request.Request(
             self.base_url + "/api/chat",
             data=payload,
@@ -187,6 +191,9 @@ class OllamaClient:
             {"model": model, "prompt": prompt, "stream": False},
             timeout=300,
         )
+
+    def embed(self, text: str, model: str = "nomic-embed-text") -> Optional[dict]:
+        return self._post("/api/embed", {"model": model, "input": text}, timeout=60)
 
     def disk_models(self) -> list[dict]:
         """Read manifest files from disk when service is down."""
@@ -372,3 +379,109 @@ class OllamaClient:
         except Exception:
             pass
         return None
+
+
+def search_models(keyword: str, limit: int = 20) -> list[dict]:
+    """Scrape ollama.com/search?q= (HTMX fragment, HX-Request header required).
+    Returns [{name, description, capabilities, sizes, pulls, tags, updated}].
+    Raises ConnectionError on failure.
+    """
+    import html.parser
+    import urllib.parse
+    url = f"https://ollama.com/search?q={urllib.parse.quote_plus(keyword)}"
+    req = urllib.request.Request(
+        url,
+        headers={"HX-Request": "true", "User-Agent": "olm/1"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            html_text = r.read().decode("utf-8", errors="replace")
+    except Exception as exc:
+        raise ConnectionError(f"ollama.com 連線失敗：{exc}") from exc
+
+    class _P(html.parser.HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.items: list[list[str]] = []
+            self._in_li = False
+            self._stack: list[str] = []
+            self._li_depth = 0
+            self._buf: list[str] = []
+
+        def handle_starttag(self, tag, attrs):
+            self._stack.append(tag)
+            if tag == "li":
+                self._in_li = True
+                self._buf = []
+                self._li_depth = len(self._stack)
+
+        def handle_endtag(self, tag):
+            if self._stack and self._stack[-1] == tag:
+                self._stack.pop()
+            if self._in_li and tag == "li" and len(self._stack) < self._li_depth:
+                self._in_li = False
+                self.items.append(self._buf[:])
+
+        def handle_data(self, d):
+            if self._in_li:
+                s = d.strip()
+                if s:
+                    self._buf.append(s)
+
+    p = _P()
+    p.feed(html_text)
+
+    _SKIP = frozenset({"Models", "Docs", "Pricing", "Download", "Sign In", "Log In", "Blog", "Enterprise"})
+    _KNOWN_CAPS = frozenset({"tools", "vision", "embed", "code", "math", "audio"})
+    _SIZE_RE = re.compile(r'^\d+\.?\d*[bBkKmMgGtT]$')
+    _NUM_RE = re.compile(r'^[\d.,]+[KMBkmb]?$')
+
+    results: list[dict] = []
+    for buf in p.items:
+        if len(buf) < 2:
+            continue
+        name = buf[0]
+        if name in _SKIP or not re.match(r'^[a-z0-9._/:-]+$', name):
+            continue
+        desc = buf[1] if len(buf) > 1 else ""
+        capabilities: list[str] = []
+        sizes: list[str] = []
+        pulls = "?"
+        tags = "?"
+        updated = ""
+        i = 2
+        while i < len(buf):
+            v = buf[i]
+            if v.lower() in _KNOWN_CAPS:
+                capabilities.append(v.lower())
+                i += 1
+            elif _NUM_RE.match(v) and i + 1 < len(buf) and buf[i + 1] == "Pulls":
+                pulls = v
+                i += 2
+            elif _NUM_RE.match(v) and i + 1 < len(buf) and buf[i + 1] == "Tags":
+                tags = v
+                i += 2
+            elif v == "Pulls":
+                i += 1
+            elif _SIZE_RE.match(v):
+                sizes.append(v)
+                i += 1
+            elif v == "Tags":
+                i += 1
+            elif v == "Updated" and i + 1 < len(buf):
+                updated = buf[i + 1]
+                i += 2
+            else:
+                i += 1
+        results.append({
+            "name": name,
+            "description": desc,
+            "capabilities": capabilities,
+            "sizes": sizes,
+            "pulls": pulls,
+            "tags": tags,
+            "updated": updated,
+        })
+        if len(results) >= limit:
+            break
+    return results

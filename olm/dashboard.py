@@ -1,5 +1,6 @@
 """Interactive dashboard / menu mode for olm."""
 import os
+import json as _json_mod
 import subprocess
 from typing import Optional
 
@@ -13,6 +14,98 @@ from .api import OllamaClient, LOGFILE, _sysmem
 from .db import Settings, parse_ctx, fmt_ctx
 
 console = Console()
+
+
+def _gguf_read_ctx(path: str) -> Optional[int]:
+    """從 GGUF binary 讀 context_length（最小解析，不依賴外部套件）。"""
+    import struct
+    _GGUF_TYPES = {
+        0: ("B", 1), 1: ("b", 1), 2: ("H", 2), 3: ("h", 2),
+        4: ("I", 4), 5: ("i", 4), 6: ("f", 4), 7: ("?", 1),
+        10: ("Q", 8), 11: ("q", 8), 12: ("d", 8),
+    }
+    try:
+        with open(path, "rb") as f:
+            if f.read(4) != b"GGUF":
+                return None
+            version = struct.unpack("<I", f.read(4))[0]
+            if version not in (2, 3):
+                return None
+            _n_tensors = struct.unpack("<Q", f.read(8))[0]
+            n_kv = struct.unpack("<Q", f.read(8))[0]
+
+            def read_str() -> str:
+                ln = struct.unpack("<Q", f.read(8))[0]
+                return f.read(ln).decode("utf-8", errors="replace")
+
+            def skip_value(vtype: int) -> None:
+                if vtype in _GGUF_TYPES:
+                    f.read(_GGUF_TYPES[vtype][1])
+                elif vtype == 8:  # string
+                    ln = struct.unpack("<Q", f.read(8))[0]
+                    f.read(ln)
+                elif vtype == 9:  # array
+                    elem_type = struct.unpack("<I", f.read(4))[0]
+                    count = struct.unpack("<Q", f.read(8))[0]
+                    for _ in range(count):
+                        skip_value(elem_type)
+
+            for _ in range(n_kv):
+                key = read_str()
+                vtype = struct.unpack("<I", f.read(4))[0]
+                if key.endswith(".context_length") or key == "context_length":
+                    if vtype in _GGUF_TYPES:
+                        fmt, sz = _GGUF_TYPES[vtype]
+                        val = struct.unpack(f"<{fmt}", f.read(sz))[0]
+                        return int(val)
+                skip_value(vtype)
+    except Exception:
+        pass
+    return None
+
+
+def _read_model_ctx_from_disk(model_name: str) -> str:
+    """從 OLLAMA_MODELS manifest 找 GGUF model layer，讀 context_length；不需 Ollama 在跑。"""
+    base = os.environ.get("OLLAMA_MODELS") or os.path.expanduser("~/.ollama/models")
+    if ":" in model_name:
+        name, tag = model_name.rsplit(":", 1)
+    else:
+        name, tag = model_name, "latest"
+
+    if "/" not in name:
+        name = f"library/{name}"
+
+    manifest_path = os.path.join(base, "manifests", "registry.ollama.ai", name, tag)
+    if not os.path.exists(manifest_path):
+        return "?"
+
+    try:
+        with open(manifest_path) as f:
+            manifest = _json_mod.load(f)
+
+        # 找 model layer（mediaType 以 .model 結尾）
+        model_digest = None
+        for layer in manifest.get("layers", []):
+            mt = layer.get("mediaType", "")
+            if mt.endswith(".model"):
+                model_digest = layer.get("digest", "")
+                break
+        if not model_digest:
+            return "?"
+
+        blob_hash = model_digest.replace("sha256:", "")
+        blob_path = os.path.join(base, "blobs", f"sha256-{blob_hash}")
+        if not os.path.exists(blob_path):
+            return "?"
+
+        ctx = _gguf_read_ctx(blob_path)
+        if not ctx:
+            return "?"
+        if ctx >= 1024:
+            return f"{ctx // 1024}K"
+        return str(ctx)
+    except Exception:
+        return "?"
 
 
 def _gb(b: int) -> float:
@@ -141,7 +234,11 @@ def _render_dashboard(client: OllamaClient, settings: Settings):
         console.print(Panel("（無）", title=f"[green bold]Installed Models[/]{hint}", border_style="dim"))
     else:
         for i, m in enumerate(installed, 1):
-            ctx_col = fmt_ctx(client.model_max_ctx(m["name"])) if running else "?"
+            if running:
+                mx = client.model_max_ctx(m["name"])
+                ctx_col = fmt_ctx(mx) if mx else _read_model_ctx_from_disk(m["name"])
+            else:
+                ctx_col = _read_model_ctx_from_disk(m["name"])
             inst_table.add_row(str(i), m["name"], f"{_gb(m.get('size', 0)):.1f} GB", ctx_col)
         console.print(Panel(inst_table, title=f"[green bold]Installed Models[/]{hint}", border_style="green"))
 
@@ -163,6 +260,9 @@ def _render_dashboard(client: OllamaClient, settings: Settings):
         ("0", "Benchmark", "測試 tok/s 推論速度"),
         ("d", "Delete model", "從磁碟刪除模型"),
         ("f", "Search models", "搜尋 Ollama 模型庫"),
+        ("g", "Gateway", "閘道 IP 白名單管理"),
+        ("h", "History", "對話歷史"),
+        ("p", "Presets", "預設集管理"),
         ("s", "Settings", "調整設定（存 SQLite）"),
         ("r", "Refresh", "重新整理"),
         ("q", "Quit", "離開"),
@@ -657,6 +757,60 @@ def run_dashboard(client: OllamaClient, settings: Settings):
                                 title=f"[green bold]搜尋：{keyword}[/]",
                                 border_style="green",
                             ))
+
+            elif action == "g":
+                acl = settings.gateway_list_allow()
+                if not acl:
+                    console.print("[yellow]（白名單為空——閘道僅 localhost 可用）[/yellow]")
+                    console.print("提示：在 shell 用 [bold]olm gateway allow 192.168.0.176[/bold] 加入")
+                else:
+                    t = Table(box=box.SIMPLE)
+                    t.add_column("CIDR", style="bold")
+                    t.add_column("備注")
+                    t.add_column("加入時間")
+                    for r in acl:
+                        t.add_row(r["cidr"], r["note"] or "-", (r["created_at"] or "")[:16])
+                    console.print(Panel(t, title="[green bold]閘道 IP 白名單[/]", border_style="green"))
+                input("[dim]按 Enter 返回[/dim]")
+                continue
+
+            elif action == "h":
+                convs = settings.list_conversations(limit=10)
+                if not convs:
+                    console.print("[yellow]（無對話歷史）[/yellow]  用 olm chat --save <名稱> 儲存對話")
+                else:
+                    t = Table(box=box.SIMPLE)
+                    t.add_column("#", style="dim")
+                    t.add_column("名稱", style="bold")
+                    t.add_column("模型")
+                    t.add_column("更新")
+                    for i, c in enumerate(convs, 1):
+                        t.add_row(str(i), c["name"], c["model"], (c["updated_at"] or "")[:16])
+                    console.print(Panel(t, title="[cyan bold]對話歷史（最近 10 筆）[/]", border_style="cyan"))
+                    console.print("[dim]詳細操作：olm history list/show/export[/dim]")
+                input("[dim]按 Enter 返回[/dim]")
+                continue
+
+            elif action == "p":
+                presets = settings.list_presets()
+                if not presets:
+                    console.print("[yellow]（無 Preset）[/yellow]  用 olm preset save <名稱> 儲存")
+                else:
+                    t = Table(box=box.SIMPLE)
+                    t.add_column("名稱", style="bold")
+                    t.add_column("模型")
+                    t.add_column("Temp", justify="right")
+                    t.add_column("建立")
+                    for pr in presets:
+                        t.add_row(
+                            pr["name"], pr["model"] or "-",
+                            str(pr.get("temperature") or "-"),
+                            (pr.get("created_at") or "")[:16],
+                        )
+                    console.print(Panel(t, title="[magenta bold]Presets[/]", border_style="magenta"))
+                    console.print("[dim]使用：olm chat --preset <名稱>[/dim]")
+                input("[dim]按 Enter 返回[/dim]")
+                continue
 
             else:
                 console.print(f"[red]✗ 無效選擇: {action}[/red]")

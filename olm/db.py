@@ -9,6 +9,10 @@ DEFAULTS: dict[str, str] = {
     "request_timeout": "28800",
     "chat_timeout": "21600",
     "default_model": "qwen3.6:27b",
+    # 閘道輪新增：Ollama 私有埠（11551）與閘道公開埠（11434）
+    "ollama_port": "11551",
+    "gateway_host": "127.0.0.1",
+    "gateway_port": "11434",
 }
 
 
@@ -100,6 +104,18 @@ class Settings:
     @property
     def default_model(self) -> str:
         return self.get("default_model")
+
+    @property
+    def ollama_port(self) -> int:
+        return int(self.get("ollama_port"))
+
+    @property
+    def gateway_host(self) -> str:
+        return self.get("gateway_host")
+
+    @property
+    def gateway_port(self) -> int:
+        return int(self.get("gateway_port"))
 
 
 def parse_ctx(s: str) -> int | None:

@@ -50,17 +50,19 @@ def _pick(prompt: str, options: list[str], default: str = "") -> str:
 def _render_dashboard(client: OllamaClient, settings: Settings):
     os.system("clear")
     running = client.is_running()
-    pid = client.server_pid() if running else None
-    port = os.environ.get("OLLAMA_PORT", "11434")
+    ol_pid = client.server_pid(settings.ollama_port) if running else None
+    gw_pid = client.gateway_pid(settings.gateway_port)
 
     # ── Service status panel ──────────────────────────────────
     svc_color = "green" if running else "red"
     svc_label = "running" if running else "stopped"
+    gw_color = "green" if gw_pid else "red"
+    gw_label = "running" if gw_pid else "stopped"
     total_b, used_b, free_b = _sysmem()
 
     lines = [
-        f"service: [{svc_color} bold]{svc_label}[/]   url=[bold]{client.base_url}[/]",
-        f"pid: [bold]{pid or '?'}[/]   port: [bold]{port}[/]",
+        f"閘道(gate): [{gw_color} bold]{gw_label}[/]  127.0.0.1:{settings.gateway_port}  pid=[bold]{gw_pid or '?'}[/]",
+        f"Ollama:     [{svc_color} bold]{svc_label}[/]  127.0.0.1:{settings.ollama_port}  pid=[bold]{ol_pid or '?'}[/]",
         f"default_model: [bold]{settings.default_model}[/]",
         f"context_length: [bold]{fmt_ctx(settings.num_ctx)}[/]",
         f"request_timeout: [bold]{settings.request_timeout}s[/]   chat_timeout: [bold]{settings.chat_timeout}s[/]",
@@ -359,36 +361,52 @@ def run_dashboard(client: OllamaClient, settings: Settings):
             running = client.is_running()
             if action == "1":
                 if running:
-                    console.print("[yellow]⚠ 服務已在運行[/yellow]")
+                    console.print("[yellow]⚠ Ollama 已在運行[/yellow]")
                 else:
-                    port = int(os.environ.get("OLLAMA_PORT", "11434"))
-                    pid = client.start_server(port, settings.num_ctx, settings.keep_alive)
-                    console.print(f"[cyan]▶ 背景啟動 Ollama port={port}[/cyan]")
                     import time
+                    ollama_port = settings.ollama_port
+                    gw_host = settings.gateway_host
+                    gw_port = settings.gateway_port
+                    pid = client.start_server(ollama_port, settings.num_ctx, settings.keep_alive)
+                    console.print(f"[cyan]▶ 啟動 Ollama port={ollama_port}（私有埠）[/cyan]")
                     for _ in range(15):
                         time.sleep(1)
                         if client.is_running():
-                            console.print(f"[green]✓ 服務就緒 PID={pid}（尚未預載模型）[/green]")
+                            console.print(f"[green]✓ Ollama 就緒 PID={pid}[/green]")
                             break
                     else:
-                        console.print("[red]✗ 服務啟動逾時[/red]")
+                        console.print("[red]✗ Ollama 啟動逾時[/red]")
+                        break
+                    client.start_gateway(gw_host, gw_port, ollama_port, settings.chat_timeout)
+                    time.sleep(1)
+                    gw_pid = client.gateway_pid(gw_port)
+                    console.print(f"[green]✓ 閘道就緒 PID={gw_pid}  127.0.0.1:{gw_port}[/green]")
 
             elif action == "2":
-                if client.stop_server():
-                    console.print("[green]✓ Ollama 已停止[/green]")
+                import time
+                client.stop_gateway(settings.gateway_port)
+                if client.stop_server(settings.ollama_port):
+                    console.print("[green]✓ 閘道與 Ollama 已停止[/green]")
                 else:
                     console.print("[yellow]⚠ 找不到 Ollama 進程[/yellow]")
 
             elif action == "3":
-                client.stop_server()
-                import time; time.sleep(1)
-                port = int(os.environ.get("OLLAMA_PORT", "11434"))
-                pid = client.start_server(port, settings.num_ctx, settings.keep_alive)
+                import time
+                ollama_port = settings.ollama_port
+                gw_host = settings.gateway_host
+                gw_port = settings.gateway_port
+                client.stop_gateway(gw_port)
+                client.stop_server(ollama_port)
+                time.sleep(1)
+                pid = client.start_server(ollama_port, settings.num_ctx, settings.keep_alive)
                 for _ in range(15):
                     time.sleep(1)
                     if client.is_running():
-                        console.print(f"[green]✓ 重啟完成 PID={pid}[/green]")
                         break
+                client.start_gateway(gw_host, gw_port, ollama_port, settings.chat_timeout)
+                time.sleep(1)
+                gw_pid = client.gateway_pid(gw_port)
+                console.print(f"[green]✓ 重啟完成 Ollama PID={pid} / 閘道 PID={gw_pid}[/green]")
 
             elif action == "4":
                 if not running:

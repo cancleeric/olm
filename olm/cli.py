@@ -24,7 +24,9 @@ console = Console()
 
 
 def _client() -> OllamaClient:
-    return OllamaClient()
+    # 閘道輪：直連 Ollama 私有埠，繞過閘道（olm 自身不需過自己的門）
+    s = _settings()
+    return OllamaClient(f"http://127.0.0.1:{s.ollama_port}")
 
 
 def _settings() -> Settings:
@@ -78,10 +80,23 @@ def cmd_list():
 
 
 # ── status ────────────────────────────────────────────────────
-@app.command("status", help="顯示已載入記憶體的模型（含 ctx 資訊）")
+@app.command("status", help="顯示閘道/Ollama 進程狀態與已載入記憶體的模型")
 def cmd_status():
     client = _client()
     settings = _settings()
+
+    # ── 閘道輪：顯示「門 + Ollama」兩程序狀態 ────────────────────
+    gw_pid = client.gateway_pid(settings.gateway_port)
+    ol_pid = client.server_pid(settings.ollama_port)
+    gw_label = f"[green]運行中[/] PID={gw_pid}" if gw_pid else "[red]未啟動[/]"
+    ol_label = f"[green]運行中[/] PID={ol_pid}" if ol_pid else "[red]未啟動[/]"
+    console.print(Panel(
+        f"閘道   127.0.0.1:{settings.gateway_port}  {gw_label}\n"
+        f"Ollama 127.0.0.1:{settings.ollama_port}  {ol_label}",
+        title="[green bold]進程狀態[/]",
+        border_style="green" if (gw_pid and ol_pid) else "yellow",
+    ))
+
     _require_running(client)
     loaded = client.list_loaded()
 
@@ -236,48 +251,83 @@ def cmd_start():
     if client.is_running():
         console.print(f"[yellow]⚠ 服務已在 {client.base_url} 運行[/yellow]")
         return
-    port = int(os.environ.get("OLLAMA_PORT", "11434"))
-    console.print(f"[cyan]▶ 背景啟動 Ollama port={port}（不預載模型）[/cyan]")
-    pid = client.start_server(port, settings.num_ctx, settings.keep_alive)
+    ollama_port = settings.ollama_port
+    gw_host = settings.gateway_host
+    gw_port = settings.gateway_port
+
+    # 1. 起 Ollama（私有埠 11551）
+    console.print(f"[cyan]▶ 背景啟動 Ollama port={ollama_port}（私有，只綁 127.0.0.1）[/cyan]")
+    pid = client.start_server(ollama_port, settings.num_ctx, settings.keep_alive)
     for _ in range(15):
         time.sleep(1)
         if client.is_running():
-            console.print(f"[green]✓ 服務就緒 PID={pid}（首次推論才載入模型）[/green]")
-            return
-    console.print("[red]✗ 服務啟動逾時[/red]")
-    raise typer.Exit(1)
+            break
+    else:
+        console.print("[red]✗ Ollama 啟動逾時[/red]")
+        raise typer.Exit(1)
+    console.print(f"[green]✓ Ollama 就緒 PID={pid}（首次推論才載入模型）[/green]")
+
+    # 2. 起閘道（公開 127.0.0.1:11434，外網打不進來）
+    console.print(f"[cyan]▶ 啟動閘道 {gw_host}:{gw_port} → :ollama:{ollama_port}[/cyan]")
+    client.start_gateway(gw_host, gw_port, ollama_port, settings.chat_timeout)
+    time.sleep(1)  # 等 pidfile 寫入
+    gw_pid = client.gateway_pid(gw_port)
+    if gw_pid:
+        console.print(f"[green]✓ 閘道就緒 PID={gw_pid}  127.0.0.1:{gw_port}（外網即斷）[/green]")
+    else:
+        console.print("[red]✗ 閘道啟動失敗[/red]")
+        raise typer.Exit(1)
 
 
 # ── stop ──────────────────────────────────────────────────────
-@app.command("stop", help="停止 Ollama 服務")
+@app.command("stop", help="停止閘道與 Ollama 服務")
 def cmd_stop():
     client = _client()
-    port = int(os.environ.get("OLLAMA_PORT", "11434"))
-    if client.stop_server(port):
-        console.print("[green]✓ Ollama 已停止[/green]")
+    settings = _settings()
+    # 先停閘道（11434），再停 Ollama（11551）
+    gw_ok = client.stop_gateway(settings.gateway_port)
+    ol_ok = client.stop_server(settings.ollama_port)
+    if gw_ok:
+        console.print(f"[green]✓ 閘道已停止 (:{settings.gateway_port})[/green]")
     else:
-        console.print("[yellow]⚠ 找不到 Ollama 進程[/yellow]")
+        console.print(f"[yellow]⚠ 找不到閘道進程 (:{settings.gateway_port})[/yellow]")
+    if ol_ok:
+        console.print(f"[green]✓ Ollama 已停止 (:{settings.ollama_port})[/green]")
+    else:
+        console.print(f"[yellow]⚠ 找不到 Ollama 進程 (:{settings.ollama_port})[/yellow]")
 
 
 # ── restart ───────────────────────────────────────────────────
-@app.command("restart", help="重啟 Ollama 服務")
+@app.command("restart", help="重啟閘道與 Ollama 服務")
 def cmd_restart():
     import time
     client = _client()
     settings = _settings()
-    console.print("[cyan]▶ 停止服務…[/cyan]")
-    client.stop_server()
+    ollama_port = settings.ollama_port
+    gw_host = settings.gateway_host
+    gw_port = settings.gateway_port
+
+    console.print("[cyan]▶ 停止閘道與 Ollama…[/cyan]")
+    client.stop_gateway(gw_port)
+    client.stop_server(ollama_port)
     time.sleep(1)
-    port = int(os.environ.get("OLLAMA_PORT", "11434"))
-    console.print("[cyan]▶ 重啟服務…[/cyan]")
-    pid = client.start_server(port, settings.num_ctx, settings.keep_alive)
+
+    console.print(f"[cyan]▶ 重啟 Ollama port={ollama_port}…[/cyan]")
+    pid = client.start_server(ollama_port, settings.num_ctx, settings.keep_alive)
     for _ in range(15):
         time.sleep(1)
         if client.is_running():
-            console.print(f"[green]✓ 重啟完成 PID={pid}[/green]")
-            return
-    console.print("[red]✗ 重啟逾時[/red]")
-    raise typer.Exit(1)
+            break
+    else:
+        console.print("[red]✗ Ollama 重啟逾時[/red]")
+        raise typer.Exit(1)
+    console.print(f"[green]✓ Ollama 就緒 PID={pid}[/green]")
+
+    console.print(f"[cyan]▶ 重啟閘道 {gw_host}:{gw_port}…[/cyan]")
+    client.start_gateway(gw_host, gw_port, ollama_port, settings.chat_timeout)
+    time.sleep(1)
+    gw_pid = client.gateway_pid(gw_port)
+    console.print(f"[green]✓ 重啟完成 閘道 PID={gw_pid} / Ollama PID={pid}[/green]")
 
 
 # ── pull ──────────────────────────────────────────────────────

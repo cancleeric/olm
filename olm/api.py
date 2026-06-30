@@ -2,6 +2,7 @@
 import json
 import os
 import subprocess
+import sys
 import urllib.request
 import urllib.error
 from pathlib import Path
@@ -10,6 +11,9 @@ import re
 
 LOGFILE = "/tmp/ollama-serve.log"
 PIDFILE = "/tmp/ollama-serve.pid"
+
+# 閘道常數（對應 gateway.py）
+from .gateway import GATEWAY_PIDFILE, GATEWAY_LOGFILE
 
 
 def _sysmem() -> tuple[Optional[int], Optional[int], Optional[int]]:
@@ -37,8 +41,9 @@ def _sysmem() -> tuple[Optional[int], Optional[int], Optional[int]]:
 
 class OllamaClient:
     def __init__(self, base_url: str | None = None):
-        port = os.environ.get("OLLAMA_PORT", "11434")
-        host = os.environ.get("OLLAMA_HOST", f"http://localhost:{port}")
+        # 閘道輪後：olm client 直連私有埠 11551，繞過自己的門（免多一跳）
+        port = os.environ.get("OLLAMA_PORT", "11551")
+        host = os.environ.get("OLLAMA_HOST", f"http://127.0.0.1:{port}")
         self.base_url = (base_url or host).rstrip("/")
         self._ctx_cache: dict[str, int] = {}
 
@@ -221,13 +226,14 @@ class OllamaClient:
 
     def start_server(
         self,
-        port: int = 11434,
+        port: int = 11551,
         ctx: int = 262144,
         keep_alive: str = "24h",
         logfile: str = LOGFILE,
     ) -> Optional[int]:
         env = os.environ.copy()
-        env["OLLAMA_HOST"] = f"0.0.0.0:{port}"
+        # 閘道輪：Ollama 只綁本機私有埠（127.0.0.1），外網無法直達
+        env["OLLAMA_HOST"] = f"127.0.0.1:{port}"
         env["OLLAMA_NUM_CTX"] = str(ctx)
         env["OLLAMA_KEEP_ALIVE"] = keep_alive
         with open(logfile, "a") as log:
@@ -242,7 +248,8 @@ class OllamaClient:
             f.write(str(proc.pid))
         return proc.pid
 
-    def stop_server(self, port: int = 11434) -> bool:
+    def stop_server(self, port: int = 11551) -> bool:
+        """停止 Ollama 服務（私有埠）。"""
         try:
             result = subprocess.check_output(
                 ["lsof", "-t", f"-iTCP:{port}", "-sTCP:LISTEN", "-Pn"],
@@ -261,10 +268,75 @@ class OllamaClient:
         except Exception:
             return False
 
-    def server_pid(self, port: int = 11434) -> Optional[int]:
+    def server_pid(self, port: int = 11551) -> Optional[int]:
+        """取得 Ollama 私有埠的 PID。"""
         try:
             result = subprocess.check_output(
                 ["lsof", "-t", f"-iTCP:{port}", "-sTCP:LISTEN", "-Pn"],
+                stderr=subprocess.DEVNULL,
+            ).decode().strip()
+            if result:
+                return int(result.split()[0])
+        except Exception:
+            pass
+        return None
+
+    # ── 閘道管理 ─────────────────────────────────────────────────────────────
+
+    def start_gateway(
+        self,
+        gateway_host: str = "127.0.0.1",
+        gateway_port: int = 11434,
+        ollama_port: int = 11551,
+        timeout: int = 21600,
+        logfile: str = GATEWAY_LOGFILE,
+    ) -> Optional[int]:
+        """背景啟動閘道子程序（-m olm.gateway），回傳子程序 PID。"""
+        with open(logfile, "a") as log:
+            proc = subprocess.Popen(
+                [
+                    sys.executable, "-m", "olm.gateway",
+                    "--gateway-host", gateway_host,
+                    "--gateway-port", str(gateway_port),
+                    "--ollama-port", str(ollama_port),
+                    "--timeout", str(timeout),
+                ],
+                stdout=log,
+                stderr=log,
+                start_new_session=True,
+            )
+        return proc.pid
+
+    def stop_gateway(self, gateway_port: int = 11434) -> bool:
+        """停止閘道：先試 pidfile，再試 lsof 掃埠。"""
+        # 嘗試從 pidfile 讀 PID
+        try:
+            with open(GATEWAY_PIDFILE) as f:
+                pid = f.read().strip()
+            if pid:
+                subprocess.run(["kill", pid], check=False)
+                return True
+        except FileNotFoundError:
+            pass
+        # fallback：掃 gateway_port
+        try:
+            result = subprocess.check_output(
+                ["lsof", "-t", f"-iTCP:{gateway_port}", "-sTCP:LISTEN", "-Pn"],
+                stderr=subprocess.DEVNULL,
+            ).decode().strip()
+            if result:
+                for pid in result.split():
+                    subprocess.run(["kill", pid], check=False)
+                return True
+        except subprocess.CalledProcessError:
+            pass
+        return False
+
+    def gateway_pid(self, gateway_port: int = 11434) -> Optional[int]:
+        """取得閘道進程 PID（優先 lsof 確認真的在監聽）。"""
+        try:
+            result = subprocess.check_output(
+                ["lsof", "-t", f"-iTCP:{gateway_port}", "-sTCP:LISTEN", "-Pn"],
                 stderr=subprocess.DEVNULL,
             ).decode().strip()
             if result:

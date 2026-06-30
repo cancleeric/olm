@@ -117,6 +117,39 @@ class OllamaClient:
                     except json.JSONDecodeError:
                         continue
 
+    def chat_stream(
+        self,
+        model: str,
+        messages: list[dict],
+        options: dict | None = None,
+        keep_alive: str = "24h",
+        timeout: int = 21600,
+    ):
+        """串流 /api/chat NDJSON，每次 yield 一個 chunk dict。
+        容錯：空行跳過、JSONDecodeError 跳過；連線/逾時錯誤向上拋。
+        """
+        payload = json.dumps({
+            "model": model,
+            "messages": messages,
+            "stream": True,
+            "keep_alive": keep_alive,
+            "options": options or {},
+        }).encode()
+        req = urllib.request.Request(
+            self.base_url + "/api/chat",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            for raw_line in r:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    yield json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
     def load(self, model: str, ctx: int, keep_alive: str = "24h") -> bool:
         d = self._post(
             "/api/generate",

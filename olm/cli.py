@@ -12,7 +12,7 @@ from rich import box
 
 from .api import OllamaClient, LOGFILE, _sysmem
 from .db import Settings, parse_ctx, fmt_ctx
-from .dashboard import run_dashboard, _do_bench, _pick
+from .dashboard import run_dashboard, _do_bench, _pick, _do_chat_repl
 
 app = typer.Typer(
     name="olm",
@@ -88,6 +88,7 @@ def cmd_status():
     t = Table(box=box.SIMPLE, show_header=True, header_style="green bold")
     t.add_column("Model", style="bold")
     t.add_column("RAM", justify="right")
+    t.add_column("VRAM", justify="right")
     t.add_column("ctx(actual/max)")
     t.add_column("expires")
 
@@ -97,13 +98,15 @@ def cmd_status():
 
     for m in loaded:
         sz = m.get("size", 0)
+        sv = m.get("size_vram", 0)
+        vram_col = "-" if not sv else f"{_gb(sv):.1f} GB"
         actual = m.get("context_length")
         mx = client.model_max_ctx(m["name"])
         ctx_str = f"{fmt_ctx(actual)}/{fmt_ctx(mx)}"
         warn = ""
         if actual and actual < settings.effective_ctx(m["name"]):
             warn = " [yellow]⚠ 降載[/]"
-        t.add_row(m["name"], f"{_gb(sz):.1f} GB", ctx_str + warn, m.get("expires_at", "?")[:19])
+        t.add_row(m["name"], f"{_gb(sz):.1f} GB", vram_col, ctx_str + warn, m.get("expires_at", "?")[:19])
 
     console.print(Panel(t, title="[green bold]Loaded Models[/]", border_style="green"))
 
@@ -187,6 +190,41 @@ def cmd_run(model: Annotated[Optional[str], typer.Argument()] = None):
     env = os.environ.copy()
     env["OLLAMA_NUM_CTX"] = str(ctx)
     subprocess.run(["ollama", "run", m], env=env)
+
+
+# ── chat ──────────────────────────────────────────────────────
+@app.command("chat", help="多輪對話（自控 system prompt 與取樣參數）")
+def cmd_chat(
+    model: Annotated[Optional[str], typer.Argument()] = None,
+    system: Annotated[Optional[str], typer.Option("--system", "-s", help="System prompt")] = None,
+    temp: Annotated[Optional[float], typer.Option("--temp", help="Temperature")] = None,
+    top_p: Annotated[Optional[float], typer.Option("--top-p", help="top_p 取樣")] = None,
+    top_k: Annotated[Optional[int], typer.Option("--top-k", help="top_k 取樣")] = None,
+    stop: Annotated[Optional[list[str]], typer.Option("--stop", help="停止序列（可多次）")] = None,
+    no_stream: Annotated[bool, typer.Option("--no-stream", help="等完整回應再印")] = False,
+):
+    client = _client()
+    settings = _settings()
+    _require_running(client)
+    m = model or settings.default_model
+
+    # 只把「有給的」取樣參數放進 options
+    options: dict = {}
+    if temp is not None:
+        options["temperature"] = temp
+    if top_p is not None:
+        options["top_p"] = top_p
+    if top_k is not None:
+        options["top_k"] = top_k
+    if stop:
+        options["stop"] = list(stop)
+
+    _do_chat_repl(
+        client, settings, m,
+        system=system,
+        options=options or None,
+        no_stream=no_stream,
+    )
 
 
 # ── start ─────────────────────────────────────────────────────

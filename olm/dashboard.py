@@ -228,6 +228,7 @@ def _render_dashboard(client: OllamaClient, settings: Settings):
     inst_table.add_column("Model", style="bold")
     inst_table.add_column("Size", justify="right")
     inst_table.add_column("支援 ctx")
+    inst_table.add_column("fits?", justify="center")
 
     hint = " [yellow](讀自磁碟)[/]" if from_disk else ""
     if not installed:
@@ -239,7 +240,20 @@ def _render_dashboard(client: OllamaClient, settings: Settings):
                 ctx_col = fmt_ctx(mx) if mx else _read_model_ctx_from_disk(m["name"])
             else:
                 ctx_col = _read_model_ctx_from_disk(m["name"])
-            inst_table.add_row(str(i), m["name"], f"{_gb(m.get('size', 0)):.1f} GB", ctx_col)
+            # #3 MLX 格式標注
+            if ctx_col == "?" and "mlx" in m["name"].lower():
+                ctx_col = "[dim]?(MLX)[/dim]"
+            # #2 fits? 欄：與可用 RAM 比較
+            size_b = m.get("size", 0)
+            if not size_b or not free_b:
+                fits_str = "[dim]?[/dim]"
+            elif size_b < free_b * 0.7:
+                fits_str = "[green]✓[/green]"
+            elif size_b < free_b:
+                fits_str = "[yellow]![/yellow]"
+            else:
+                fits_str = "[red]✗[/red]"
+            inst_table.add_row(str(i), m["name"], f"{m.get('size', 0) / 1e9:.1f} GB", ctx_col, fits_str)
         console.print(Panel(inst_table, title=f"[green bold]Installed Models[/]{hint}", border_style="green"))
 
     # ── Actions ───────────────────────────────────────────────
@@ -268,7 +282,14 @@ def _render_dashboard(client: OllamaClient, settings: Settings):
         ("q", "Quit", "離開"),
     ]
     for key, cmd, desc in rows:
-        actions.add_row(f"{key})", cmd, desc)
+        if not running and key in ("4", "5", "7"):
+            actions.add_row(
+                f"[dim]{key})[/dim]",
+                f"[dim]{cmd}[/dim]",
+                f"[dim]{desc}  (需先啟動)[/dim]",
+            )
+        else:
+            actions.add_row(f"{key})", cmd, desc)
     console.print(actions)
 
 
@@ -428,6 +449,25 @@ def _ctx_picker(current: int, model: str, free_ram_gb: float) -> Optional[int]:
         sys.stdout.flush()
 
     return None
+
+
+def _wait_ollama(client: "OllamaClient", timeout: int = 20) -> bool:
+    """等候 Ollama 就緒，顯示 spinner + 倒計時。回傳 True=成功。"""
+    import time
+    import sys
+    spinners = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+    for i in range(timeout):
+        sp = spinners[i % len(spinners)]
+        sys.stdout.write(f"\r  {sp} 等待 Ollama 就緒… ({i + 1}/{timeout}s)  ")
+        sys.stdout.flush()
+        if client.is_running():
+            sys.stdout.write(f"\r  ✓ 就緒（{i + 1}s）                    \n")
+            sys.stdout.flush()
+            return True
+        time.sleep(1)
+    sys.stdout.write(f"\r  ✗ 超時（{timeout}s）                    \n")
+    sys.stdout.flush()
+    return False
 
 
 def _do_chat_repl(
@@ -767,11 +807,8 @@ def run_dashboard(client: OllamaClient, settings: Settings):
                     gw_port = settings.gateway_port
                     pid = client.start_server(ollama_port, settings.num_ctx, settings.keep_alive)
                     console.print(f"[cyan]▶ 啟動 Ollama port={ollama_port}（私有埠）[/cyan]")
-                    for _ in range(15):
-                        time.sleep(1)
-                        if client.is_running():
-                            console.print(f"[green]✓ Ollama 就緒 PID={pid}[/green]")
-                            break
+                    if _wait_ollama(client, 20):
+                        console.print(f"[green]✓ Ollama 就緒 PID={pid}[/green]")
                     else:
                         console.print("[red]✗ Ollama 啟動逾時[/red]")
                         break
@@ -808,8 +845,16 @@ def run_dashboard(client: OllamaClient, settings: Settings):
 
             elif action == "4":
                 if not running:
-                    console.print("[red]✗ 服務未啟動[/red]")
-                else:
+                    console.print("[yellow]⚠ Ollama 未啟動[/yellow]")
+                    start_ans = input("  是否立即啟動？[y/N] ").strip().lower()
+                    if start_ans in ("y", "yes"):
+                        client.start_server(settings.ollama_port, settings.num_ctx, settings.keep_alive)
+                        if _wait_ollama(client, timeout=20):
+                            running = True
+                            console.print("[green]✓ Ollama 已就緒[/green]")
+                        else:
+                            console.print("[red]✗ 啟動失敗，請查 olm logs[/red]")
+                if running:
                     models_list = client.list_models()
                     names = [m["name"] for m in models_list]
                     model = _pick("載入哪個模型", names, settings.default_model)
@@ -837,8 +882,16 @@ def run_dashboard(client: OllamaClient, settings: Settings):
 
             elif action == "5":
                 if not running:
-                    console.print("[red]✗ 服務未啟動[/red]")
-                else:
+                    console.print("[yellow]⚠ Ollama 未啟動[/yellow]")
+                    start_ans = input("  是否立即啟動？[y/N] ").strip().lower()
+                    if start_ans in ("y", "yes"):
+                        client.start_server(settings.ollama_port, settings.num_ctx, settings.keep_alive)
+                        if _wait_ollama(client, timeout=20):
+                            running = True
+                            console.print("[green]✓ Ollama 已就緒[/green]")
+                        else:
+                            console.print("[red]✗ 啟動失敗，請查 olm logs[/red]")
+                if running:
                     names = [m["name"] for m in client.list_models()]
                     model = _pick("對話哪個模型", names, settings.default_model)
                     cur_ctx = settings.effective_ctx(model)
@@ -865,8 +918,16 @@ def run_dashboard(client: OllamaClient, settings: Settings):
 
             elif action == "7":
                 if not running:
-                    console.print("[red]✗ 服務未啟動[/red]")
-                else:
+                    console.print("[yellow]⚠ Ollama 未啟動[/yellow]")
+                    start_ans = input("  是否立即啟動？[y/N] ").strip().lower()
+                    if start_ans in ("y", "yes"):
+                        client.start_server(settings.ollama_port, settings.num_ctx, settings.keep_alive)
+                        if _wait_ollama(client, timeout=20):
+                            running = True
+                            console.print("[green]✓ Ollama 已就緒[/green]")
+                        else:
+                            console.print("[red]✗ 啟動失敗，請查 olm logs[/red]")
+                if running:
                     loaded = [m["name"] for m in client.list_loaded()]
                     if not loaded:
                         console.print("[yellow]⚠ 目前沒有已載入的模型[/yellow]")

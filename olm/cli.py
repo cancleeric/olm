@@ -329,6 +329,7 @@ def cmd_chat(
     repeat_penalty: Annotated[Optional[float], typer.Option("--repeat-penalty", help="重複懲罰（>1 減少重複，建議 1.1）")] = None,
     min_p: Annotated[Optional[float], typer.Option("--min-p", help="min-p 取樣（0-1）")] = None,
     seed: Annotated[Optional[int], typer.Option("--seed", help="隨機種子（-1=隨機）")] = None,
+    num_ctx: Annotated[Optional[int], typer.Option("--num-ctx", "-c", help="Context 長度（tokens）例：32768、131072")] = None,
     num_gpu: Annotated[Optional[int], typer.Option("--num-gpu", "-g", help="GPU layers（-1=全 GPU，0=純 CPU）")] = None,
     no_stream: Annotated[bool, typer.Option("--no-stream", help="等完整回應再印")] = False,
     preset: Annotated[Optional[str], typer.Option("--preset", "-p", help="載入已存 preset")] = None,
@@ -385,6 +386,8 @@ def cmd_chat(
         options["min_p"] = min_p
     if seed is not None:
         options["seed"] = seed
+    if num_ctx is not None:
+        options["num_ctx"] = num_ctx
     if num_gpu is not None:
         options["num_gpu"] = num_gpu
 

@@ -328,7 +328,7 @@ def _do_chat_repl(
         conv_id = settings.create_conversation(save_name, model)
         console.print(f"  [dim]歷史記錄中：#{conv_id} {save_name}[/dim]")
 
-    console.print(f"\n[cyan]▶ 對話：[bold]{model}[/bold]  exit 或 /bye 離開，Ctrl-D 結束[/cyan]")
+    console.print(f"\n[cyan]▶ 對話：[bold]{model}[/bold]  exit 或 /bye 離開 · /ctx 32768 動態調整 context · Ctrl-D 結束[/cyan]")
     if fmt:
         console.print(f"  [dim]輸出格式：{fmt}[/dim]")
     if options:
@@ -348,6 +348,27 @@ def _do_chat_repl(
             console.print("\n[yellow]結束對話[/yellow]")
             break
         if not user_input:
+            continue
+        if user_input.startswith("/ctx"):
+            parts = user_input.split()
+            if len(parts) == 2:
+                try:
+                    val = parts[1].upper()
+                    if val.endswith("K"):
+                        new_ctx = int(float(val[:-1]) * 1024)
+                    elif val.endswith("M"):
+                        new_ctx = int(float(val[:-1]) * 1024 * 1024)
+                    else:
+                        new_ctx = int(val)
+                    if options is None:
+                        options = {}
+                    options["num_ctx"] = new_ctx
+                    ctx_limit = new_ctx
+                    console.print(f"  [green]Context 已更新：{new_ctx:,} tokens（下一輪生效）[/green]")
+                except ValueError:
+                    console.print("  [red]格式錯誤，例：/ctx 32768 或 /ctx 128K[/red]")
+            else:
+                console.print(f"  [dim]目前 ctx_limit = {ctx_limit:,}[/dim]  用法：/ctx 32768 或 /ctx 128K")
             continue
         if user_input.lower() in ("exit", "/bye"):
             console.print("[yellow]再見[/yellow]")

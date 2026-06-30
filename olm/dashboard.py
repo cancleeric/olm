@@ -10,7 +10,7 @@ from rich.table import Table
 from rich import box
 
 from . import __version__
-from .api import OllamaClient, LOGFILE, _sysmem
+from .api import OllamaClient, LOGFILE, GATEWAY_LOGFILE, _sysmem
 from .db import Settings, parse_ctx, fmt_ctx
 
 console = Console()
@@ -315,6 +315,15 @@ def _do_bench(client: OllamaClient, settings: Settings, model: str):
     console.print(f"  generation  : {ec} tokens, {ed/1e9:.3f}s → [green bold]{gen_tps:.1f} tok/s[/green bold]")
     console.print(f"  total       : {td/1e9:.3f}s")
     settings.add_bench_result(model, gen_tps, pr_tps, td / 1e9, ec)
+    # 顯示與前次的 delta
+    history = settings.list_bench_history(model, limit=2)
+    if len(history) >= 2:
+        prev_tps = history[1]["gen_tps"]  # 倒序：0=本次, 1=前次
+        delta = gen_tps - prev_tps
+        pct = delta / prev_tps * 100 if prev_tps else 0
+        sign = "+" if delta >= 0 else ""
+        color = "green" if delta >= 0 else "red"
+        console.print(f"  [{color}]前次：{prev_tps:.1f} tok/s → 本次：{gen_tps:.1f} tok/s（{sign}{pct:.1f}%）[/{color}]")
     console.print(f"  [dim]已記錄到歷史（olm bench --history 查看）[/dim]")
 
 
@@ -616,7 +625,24 @@ def _do_chat_repl(
 
     while True:
         try:
-            user_input = input("\n[你] ").strip()
+            raw = input("\n[你] ")
+            # 多行模式：輸入 """ 或 <<< 開頭進入
+            if raw.strip() in ('"""', "<<<"):
+                console.print('  [dim]多行模式：輸入完後單獨一行 """ 或 --- 結束[/dim]')
+                lines = []
+                try:
+                    while True:
+                        line = input()
+                        if line.strip() in ('"""', "---"):
+                            break
+                        lines.append(line)
+                except EOFError:
+                    pass
+                user_input = "\n".join(lines).strip()
+                if not user_input:
+                    continue
+            else:
+                user_input = raw.strip()
         except (EOFError, KeyboardInterrupt):
             console.print("\n[yellow]結束對話[/yellow]")
             break
@@ -725,11 +751,64 @@ def _do_chat_repl(
                 system = new_system
                 console.print("[green]✓ System prompt 已更新[/green]")
             continue
+        if user_input.startswith("/preset"):
+            parts_p = user_input.split(None, 1)
+            if len(parts_p) == 2:
+                pname = parts_p[1].strip()
+                preset = settings.get_preset(pname)
+                if preset:
+                    if preset.get("system_prompt"):
+                        messages[:] = [m for m in messages if m["role"] != "system"]
+                        messages.insert(0, {"role": "system", "content": preset["system_prompt"]})
+                        system = preset["system_prompt"]
+                    # 重置取樣參數後套用 preset（避免舊 preset 殘留）
+                    if options is None:
+                        options = {}
+                    for k in ("temperature", "top_p", "top_k", "repeat_penalty", "min_p", "seed", "stop"):
+                        options.pop(k, None)
+                    for k in ("temperature", "top_p", "top_k", "repeat_penalty", "min_p", "seed"):
+                        v = preset.get(k)
+                        if v is not None:
+                            options[k] = v
+                    if preset.get("stop_seqs"):
+                        options["stop"] = preset["stop_seqs"]
+                    if preset.get("model") and preset["model"] != model:
+                        console.print(f"  [dim]Preset 建議模型：{preset['model']}（目前：{model}）[/dim]")
+                    console.print(f"[green]✓ 已載入 preset：{pname}[/green]")
+                    clear_ans = input("  是否清除目前對話？[y/N] ").strip().lower()
+                    if clear_ans in ("y", "yes"):
+                        messages.clear()
+                        if system:
+                            messages.insert(0, {"role": "system", "content": system})
+                        conv_id = None  # 重置歷史記錄
+                        if save_name:
+                            conv_id = settings.create_conversation(save_name, model)
+                            console.print(f"  [dim]已建新記錄：#{conv_id} {save_name}[/dim]")
+                else:
+                    presets = settings.list_presets()
+                    if presets:
+                        console.print("  可用 preset：")
+                        for p in presets:
+                            console.print(f"    [cyan]{p['name']}[/cyan]  {p.get('model', '') or ''}  {(p.get('system_prompt') or '')[:40]}")
+                    else:
+                        console.print("  [dim]尚無 preset，用 olm preset save 建立[/dim]")
+            else:
+                presets = settings.list_presets()
+                if presets:
+                    console.print("  可用 preset：")
+                    for p in presets:
+                        console.print(f"    [cyan]{p['name']}[/cyan]  {p.get('model', '') or ''}  {(p.get('system_prompt') or '')[:40]}")
+                    console.print("  用法：/preset <名稱>")
+                else:
+                    console.print("  [dim]尚無 preset，用 olm preset save 建立[/dim]")
+            continue
+
         if user_input.startswith("/save"):
             parts_s = user_input.split(None, 1)
             save_label = parts_s[1].strip() if len(parts_s) == 2 else f"{model}-saved"
             if conv_id is None:
                 conv_id = settings.create_conversation(save_label, model)
+                save_name = save_label  # 讓 /preset clear 也能重建記錄
                 for msg in messages:
                     if msg["role"] != "system":
                         settings.add_message(conv_id, msg["role"], msg["content"])
@@ -741,11 +820,13 @@ def _do_chat_repl(
             console.print(Panel(
                 "\n".join([
                     "[bold]/bye[/bold]         離開對話",
+                    '[bold]"""[/bold]          進入多行輸入模式（單獨 """ 或 --- 結束）',
                     "[bold]/ctx[/bold] [n]     調整 context 視窗（無參數開 picker）",
                     "[bold]/clear[/bold]       清除對話記錄（保留 system prompt）",
                     "[bold]/model[/bold] [名]  切換模型（無參數開 picker）",
                     "[bold]/temp[/bold] [0~2]  調整 temperature",
                     "[bold]/system[/bold] [p]  更新 system prompt（無參數多行輸入）",
+                    "[bold]/preset[/bold] [名] 載入 preset（system prompt + 取樣參數）",
                     "[bold]/save[/bold] [名]   開始儲存此對話到歷史記錄",
                     "[bold]/help[/bold]        顯示此說明",
                 ]),
@@ -1199,6 +1280,10 @@ def run_dashboard(client: OllamaClient, settings: Settings):
 
             elif action == "9":
                 subprocess.run(["tail", "-40", LOGFILE])
+                # 加閘道日誌
+                if os.path.exists(GATEWAY_LOGFILE):
+                    console.print("\n[dim]── 閘道日誌（最後 10 行）──[/dim]")
+                    subprocess.run(["tail", "-10", GATEWAY_LOGFILE])
 
             elif action == "0":
                 if not running:
@@ -1214,7 +1299,26 @@ def run_dashboard(client: OllamaClient, settings: Settings):
 
             elif action == "d":
                 if not running:
-                    console.print("[red]✗ 服務未啟動[/red]")
+                    # 離線模式：仍可嘗試刪除（ollama rm 不需服務）
+                    names = [m["name"] for m in client.disk_models()]
+                    if not names:
+                        console.print("[yellow]無本機模型可刪除[/yellow]")
+                    else:
+                        model = _pick("刪除哪個模型（離線）", names, "")
+                        if model:
+                            confirm = input(f"  確定刪除 {model}？[y/N] ").strip().lower()
+                            if confirm == "y":
+                                import subprocess as _sp
+                                import os as _os
+                                _env = _os.environ.copy()
+                                _env["OLLAMA_HOST"] = f"http://127.0.0.1:{settings.ollama_port}"
+                                result = _sp.run(["ollama", "rm", model], capture_output=True, text=True, env=_env)
+                                if result.returncode == 0:
+                                    console.print(f"[green]✓ 已刪除：{model}[/green]")
+                                else:
+                                    console.print(f"[red]✗ 刪除失敗：{result.stderr.strip()}[/red]")
+                            else:
+                                console.print("[yellow]已取消[/yellow]")
                 else:
                     names = [m["name"] for m in client.list_models()]
                     if not names:

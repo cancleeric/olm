@@ -67,6 +67,29 @@ class Settings:
                     created_at TEXT DEFAULT (datetime('now'))
                 )
             """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS gateway_acl (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    cidr TEXT UNIQUE NOT NULL,
+                    note TEXT,
+                    created_at TEXT DEFAULT (datetime('now'))
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS bench_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    model TEXT NOT NULL,
+                    gen_tps REAL,
+                    prompt_tps REAL,
+                    total_s REAL,
+                    eval_count INTEGER,
+                    created_at TEXT DEFAULT (datetime('now'))
+                )
+            """)
+            try:
+                conn.execute("ALTER TABLE presets ADD COLUMN extra TEXT")
+            except Exception:
+                pass  # already exists
             for k, v in DEFAULTS.items():
                 conn.execute(
                     "INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (k, v)
@@ -159,27 +182,30 @@ class Settings:
         top_p: float | None,
         top_k: int | None,
         stop_seqs: list[str] | None,
+        extra: dict | None = None,
     ):
         with self._conn() as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO presets"
-                "(name,model,system_prompt,temperature,top_p,top_k,stop_seqs)"
-                " VALUES(?,?,?,?,?,?,?)",
+                "(name,model,system_prompt,temperature,top_p,top_k,stop_seqs,extra)"
+                " VALUES(?,?,?,?,?,?,?,?)",
                 (
                     name, model, system_prompt, temperature, top_p, top_k,
                     json.dumps(stop_seqs) if stop_seqs else None,
+                    json.dumps(extra) if extra else None,
                 ),
             )
 
     def get_preset(self, name: str) -> dict | None:
         with self._conn() as conn:
             row = conn.execute(
-                "SELECT name,model,system_prompt,temperature,top_p,top_k,stop_seqs"
+                "SELECT name,model,system_prompt,temperature,top_p,top_k,stop_seqs,extra"
                 " FROM presets WHERE name=?",
                 (name,),
             ).fetchone()
         if not row:
             return None
+        extra = json.loads(row[7]) if row[7] else {}
         return {
             "name": row[0],
             "model": row[1],
@@ -188,6 +214,9 @@ class Settings:
             "top_p": row[4],
             "top_k": row[5],
             "stop_seqs": json.loads(row[6]) if row[6] else None,
+            "repeat_penalty": extra.get("repeat_penalty"),
+            "min_p": extra.get("min_p"),
+            "seed": extra.get("seed"),
         }
 
     def list_presets(self) -> list[dict]:
@@ -213,6 +242,67 @@ class Settings:
         with self._conn() as conn:
             c = conn.execute("DELETE FROM presets WHERE name=?", (name,))
             return c.rowcount > 0
+
+    # ── Gateway ACL ────────────────────────────────────────────────────────────
+
+    def gateway_add_allow(self, cidr: str, note: str = "") -> bool:
+        """Add CIDR to whitelist. Returns False if already exists."""
+        try:
+            import ipaddress
+            ipaddress.ip_network(cidr, strict=False)
+        except ValueError:
+            raise ValueError(f"無效的 IP/CIDR：{cidr}")
+        try:
+            with self._conn() as conn:
+                conn.execute("INSERT INTO gateway_acl(cidr,note) VALUES(?,?)", (cidr, note))
+            return True
+        except Exception:
+            return False
+
+    def gateway_remove_allow(self, cidr: str) -> bool:
+        with self._conn() as conn:
+            c = conn.execute("DELETE FROM gateway_acl WHERE cidr=?", (cidr,))
+            return c.rowcount > 0
+
+    def gateway_list_allow(self) -> list[dict]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT cidr,note,created_at FROM gateway_acl ORDER BY created_at"
+            ).fetchall()
+        return [{"cidr": r[0], "note": r[1], "created_at": r[2]} for r in rows]
+
+    def gateway_load_cidrs(self) -> list[str]:
+        """Load current whitelist CIDRs for runtime use."""
+        return [r["cidr"] for r in self.gateway_list_allow()]
+
+    # ── Bench History ──────────────────────────────────────────────────────────
+
+    def add_bench_result(self, model: str, gen_tps: float, prompt_tps: float, total_s: float, eval_count: int):
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT INTO bench_history(model,gen_tps,prompt_tps,total_s,eval_count) VALUES(?,?,?,?,?)",
+                (model, gen_tps, prompt_tps, total_s, eval_count),
+            )
+
+    def list_bench_history(self, model: str | None = None, limit: int = 10) -> list[dict]:
+        with self._conn() as conn:
+            if model:
+                rows = conn.execute(
+                    "SELECT model,gen_tps,prompt_tps,total_s,eval_count,created_at"
+                    " FROM bench_history WHERE model=? ORDER BY created_at DESC LIMIT ?",
+                    (model, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT model,gen_tps,prompt_tps,total_s,eval_count,created_at"
+                    " FROM bench_history ORDER BY created_at DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+        return [
+            {"model": r[0], "gen_tps": r[1], "prompt_tps": r[2],
+             "total_s": r[3], "eval_count": r[4], "created_at": r[5]}
+            for r in rows
+        ]
 
     # ── Conversation history CRUD ────────────────────────────────────────────
 

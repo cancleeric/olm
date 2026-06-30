@@ -44,6 +44,100 @@ def _gb(b: int) -> float:
     return b / 1e9
 
 
+def _show_compat(model: str):
+    """Pull 前顯示本機硬體相容性估算。"""
+    import re
+    total_b, _used_b, free_b = _sysmem()
+    if not total_b:
+        return
+    free_gb = (free_b or 0) / 1e9
+    total_gb = total_b / 1e9
+    # 從模型名稱推斷參數量（7b/13b/70b 等），q4_0 估約 0.5 bytes/param
+    size_hint = None
+    m = re.search(r'[:\-_]?(\d+\.?\d*)b', model.lower())
+    if m:
+        params_b = float(m.group(1))
+        size_hint = params_b * 1e9 * 0.5 / 1e9  # GB
+    console.print(f"\n  [dim]系統 RAM：{free_gb:.1f} GB 空閒 / {total_gb:.1f} GB 總計[/dim]")
+    if size_hint:
+        if free_gb >= size_hint * 1.2:
+            status = "[green]可載入[/green]"
+        elif free_gb >= size_hint:
+            status = "[yellow]可能剛好（建議先關閉其他模型）[/yellow]"
+        else:
+            status = "[red]RAM 可能不足[/red]"
+        console.print(f"  [dim]模型估算大小：~{size_hint:.1f} GB (q4)  {status}[/dim]")
+    console.print()
+
+
+def _detect_template_format(template: str) -> str:
+    """從 template 字串推斷格式名稱（G-D）。"""
+    t = template.lower()
+    if "<|im_start|>" in t:
+        return "ChatML"
+    if "[inst]" in t or "<<sys>>" in t:
+        return "Llama2"
+    if "<|start_header_id|>" in t:
+        return "Llama3"
+    if "### instruction" in t or "### response" in t:
+        return "Alpaca"
+    if "<|user|>" in t and "<|assistant|>" in t:
+        return "Phi"
+    if "human:" in t and "assistant:" in t:
+        return "ChatHuman"
+    if "gemma" in t or "<start_of_turn>" in t:
+        return "Gemma"
+    return "Unknown"
+
+
+def _do_pull(client: OllamaClient, model: str) -> None:
+    """下載模型（帶進度條）。供 cmd_pull 與 _ensure_model 複用（G-E）。"""
+    from rich.progress import (
+        Progress, BarColumn, DownloadColumn,
+        TransferSpeedColumn, TimeRemainingColumn, TextColumn,
+    )
+    try:
+        with Progress(
+            TextColumn("[bold cyan]{task.description}"),
+            BarColumn(),
+            DownloadColumn(),
+            TransferSpeedColumn(),
+            TimeRemainingColumn(),
+            console=console,
+            transient=True,
+        ) as progress:
+            task = progress.add_task("pulling manifest", total=None)
+            for chunk in client.pull_stream(model):
+                status = chunk.get("status", "")
+                kwargs: dict = {"description": status}
+                if "total" in chunk:
+                    kwargs["total"] = chunk["total"]
+                    kwargs["completed"] = chunk.get("completed", 0)
+                progress.update(task, **kwargs)
+        console.print(f"[green]✓ {model} 下載完成[/green]")
+        client.clear_ctx_cache()
+    except Exception:
+        console.print("[yellow]▶ 串流異常，改用 subprocess 下載…[/yellow]")
+        subprocess.run(["ollama", "pull", model])
+        client.clear_ctx_cache()
+
+
+def _ensure_model(client: OllamaClient, model: str) -> bool:
+    """若模型不存在本地，詢問是否 pull。回傳 True=可繼續, False=放棄（G-E）。"""
+    models = client.list_models()
+    names = [m["name"] for m in models]
+    base = model.split(":")[0]
+    if any(n == model or n.split(":")[0] == base for n in names):
+        return True
+    console.print(f"[yellow]找不到模型 [bold]{model}[/bold][/yellow]")
+    answer = typer.prompt("是否立即下載？(y/N)", default="N")
+    if answer.lower() not in ("y", "yes"):
+        return False
+    console.print(f"[cyan]▶ 下載 {model}...[/cyan]")
+    _do_pull(client, model)
+    return True
+
+
 # ── Default (no subcommand) → Dashboard ─────────────────────
 @app.callback(invoke_without_command=True)
 def main(ctx: typer.Context):
@@ -104,6 +198,7 @@ def cmd_status():
     t.add_column("Model", style="bold")
     t.add_column("RAM", justify="right")
     t.add_column("VRAM", justify="right")
+    t.add_column("GPU", justify="right")
     t.add_column("ctx(actual/max)")
     t.add_column("expires")
 
@@ -115,13 +210,15 @@ def cmd_status():
         sz = m.get("size", 0)
         sv = m.get("size_vram", 0)
         vram_col = "-" if not sv else f"{_gb(sv):.1f} GB"
+        num_gpu = m.get("num_gpu")
+        gpu_col = str(num_gpu) if num_gpu is not None else "-"
         actual = m.get("context_length")
         mx = client.model_max_ctx(m["name"])
         ctx_str = f"{fmt_ctx(actual)}/{fmt_ctx(mx)}"
         warn = ""
         if actual and actual < settings.effective_ctx(m["name"]):
             warn = " [yellow]⚠ 降載[/]"
-        t.add_row(m["name"], f"{_gb(sz):.1f} GB", vram_col, ctx_str + warn, m.get("expires_at", "?")[:19])
+        t.add_row(m["name"], f"{_gb(sz):.1f} GB", vram_col, gpu_col, ctx_str + warn, m.get("expires_at", "?")[:19])
 
     console.print(Panel(t, title="[green bold]Loaded Models[/]", border_style="green"))
 
@@ -132,11 +229,14 @@ def cmd_load(
     model: Annotated[Optional[str], typer.Argument()] = None,
     ctx: Annotated[Optional[str], typer.Option("--ctx", "-c", help="num_ctx (256K / 65536)")] = None,
     keep: Annotated[Optional[str], typer.Option("--keep", "-k", help="keep_alive (24h / -1)")] = None,
+    num_gpu: Annotated[Optional[int], typer.Option("--num-gpu", "-g", help="GPU layers（-1=全 GPU，0=純 CPU）")] = None,
 ):
     client = _client()
     settings = _settings()
     _require_running(client)
     m = model or settings.default_model
+    if not _ensure_model(client, m):
+        raise typer.Exit(0)
     _, _, free_b = _sysmem()
     if free_b is not None:
         minfo = next((mo for mo in client.list_models() if mo["name"] == m), {})
@@ -148,8 +248,9 @@ def cmd_load(
             )
     c = parse_ctx(ctx) if ctx else settings.effective_ctx(m)
     k = keep or settings.keep_alive
-    console.print(f"[cyan]▶ 載入 [bold]{m}[/bold]  ctx={fmt_ctx(c)}  keep_alive={k}[/cyan]")
-    ok = client.load(m, c, k)
+    gpu_hint = f"  num_gpu={num_gpu}" if num_gpu is not None else ""
+    console.print(f"[cyan]▶ 載入 [bold]{m}[/bold]  ctx={fmt_ctx(c)}  keep_alive={k}{gpu_hint}[/cyan]")
+    ok = client.load(m, c, k, num_gpu=num_gpu)
     if ok:
         console.print(f"[green]✓ {m} 已就緒[/green]")
     else:
@@ -225,6 +326,10 @@ def cmd_chat(
     top_p: Annotated[Optional[float], typer.Option("--top-p", help="top_p 取樣")] = None,
     top_k: Annotated[Optional[int], typer.Option("--top-k", help="top_k 取樣")] = None,
     stop: Annotated[Optional[list[str]], typer.Option("--stop", help="停止序列（可多次）")] = None,
+    repeat_penalty: Annotated[Optional[float], typer.Option("--repeat-penalty", help="重複懲罰（>1 減少重複，建議 1.1）")] = None,
+    min_p: Annotated[Optional[float], typer.Option("--min-p", help="min-p 取樣（0-1）")] = None,
+    seed: Annotated[Optional[int], typer.Option("--seed", help="隨機種子（-1=隨機）")] = None,
+    num_gpu: Annotated[Optional[int], typer.Option("--num-gpu", "-g", help="GPU layers（-1=全 GPU，0=純 CPU）")] = None,
     no_stream: Annotated[bool, typer.Option("--no-stream", help="等完整回應再印")] = False,
     preset: Annotated[Optional[str], typer.Option("--preset", "-p", help="載入已存 preset")] = None,
     mcp: Annotated[Optional[str], typer.Option("--mcp", help="MCP server spec（npx:pkg/cmd:exe/python:mod）")] = None,
@@ -251,9 +356,18 @@ def cmd_chat(
             top_k = p["top_k"]
         if not stop and p.get("stop_seqs"):
             stop = p["stop_seqs"]
+        if repeat_penalty is None and p.get("repeat_penalty") is not None:
+            repeat_penalty = p["repeat_penalty"]
+        if min_p is None and p.get("min_p") is not None:
+            min_p = p["min_p"]
+        if seed is None and p.get("seed") is not None:
+            seed = p["seed"]
         console.print(f"[dim]已載入 preset：{preset}[/dim]")
 
     m = model or settings.default_model
+
+    if not _ensure_model(client, m):
+        raise typer.Exit(0)
 
     # 只把「有給的」取樣參數放進 options
     options: dict = {}
@@ -265,6 +379,14 @@ def cmd_chat(
         options["top_k"] = top_k
     if stop:
         options["stop"] = list(stop)
+    if repeat_penalty is not None:
+        options["repeat_penalty"] = repeat_penalty
+    if min_p is not None:
+        options["min_p"] = min_p
+    if seed is not None:
+        options["seed"] = seed
+    if num_gpu is not None:
+        options["num_gpu"] = num_gpu
 
     mcp_client = None
     if mcp:
@@ -396,39 +518,17 @@ def cmd_restart():
 
 
 # ── pull ──────────────────────────────────────────────────────
-@app.command("pull", help="下載模型")
-def cmd_pull(model: str):
-    from rich.progress import (
-        Progress, BarColumn, DownloadColumn,
-        TransferSpeedColumn, TimeRemainingColumn, TextColumn,
-    )
+@app.command("pull", help="下載模型（pull 前顯示硬體相容性）")
+def cmd_pull(
+    model: Annotated[str, typer.Argument(help="模型名稱（含 tag）")],
+    no_check: Annotated[bool, typer.Option("--no-check", help="略過硬體相容性檢查")] = False,
+):
     client = _client()
     _require_running(client)
+    if not no_check:
+        _show_compat(model)
     console.print(f"[cyan]▶ 下載 [bold]{model}[/bold][/cyan]")
-    try:
-        with Progress(
-            TextColumn("[bold cyan]{task.description}"),
-            BarColumn(),
-            DownloadColumn(),
-            TransferSpeedColumn(),
-            TimeRemainingColumn(),
-            console=console,
-            transient=True,
-        ) as progress:
-            task = progress.add_task("pulling manifest", total=None)
-            for chunk in client.pull_stream(model):
-                status = chunk.get("status", "")
-                kwargs: dict = {"description": status}
-                if "total" in chunk:
-                    kwargs["total"] = chunk["total"]
-                    kwargs["completed"] = chunk.get("completed", 0)
-                progress.update(task, **kwargs)
-        console.print(f"[green]✓ {model} 下載完成[/green]")
-        client.clear_ctx_cache()
-    except Exception:
-        console.print("[yellow]▶ 串流異常，改用 subprocess 下載…[/yellow]")
-        subprocess.run(["ollama", "pull", model])
-        client.clear_ctx_cache()
+    _do_pull(client, model)
 
 
 # ── delete ────────────────────────────────────────────────────
@@ -471,12 +571,28 @@ def cmd_delete(
 
 
 # ── info ──────────────────────────────────────────────────────
-@app.command("info", help="查看模型詳細資訊")
-def cmd_info(model: str):
+@app.command("info", help="查看模型詳細資訊（含 prompt template 格式）")
+def cmd_info(
+    model: str,
+    verbose: Annotated[bool, typer.Option("--verbose", "-v", help="顯示完整 template 內容")] = False,
+):
+    from rich.panel import Panel as _Panel
     client = _client()
     _require_running(client)
     console.print(f"[cyan]▶ 模型資訊：[bold]{model}[/bold][/cyan]")
     subprocess.run(["ollama", "show", model])
+    # G-D: template 格式偵測
+    try:
+        data = client.show(model)
+        if data:
+            tmpl = data.get("template", "")
+            if tmpl:
+                fmt = _detect_template_format(tmpl)
+                console.print(f"  [bold]Prompt Format:[/bold] [cyan]{fmt}[/cyan]")
+                if verbose:
+                    console.print(_Panel(tmpl, title="Template", border_style="dim"))
+    except Exception:
+        pass
 
 
 # ── logs ──────────────────────────────────────────────────────
@@ -567,9 +683,33 @@ def cmd_embed(
 
 # ── bench ─────────────────────────────────────────────────────
 @app.command("bench", help="測試推論速度（tok/s）")
-def cmd_bench(model: Annotated[Optional[str], typer.Argument()] = None):
+def cmd_bench(
+    model: Annotated[Optional[str], typer.Argument()] = None,
+    history: Annotated[bool, typer.Option("--history", "-H", help="顯示歷史記錄")] = False,
+):
     client = _client()
     settings = _settings()
+
+    if history:
+        rows = settings.list_bench_history(model, limit=20)
+        if not rows:
+            console.print("[yellow]（無歷史記錄）[/yellow]  先跑 olm bench 產生數據")
+            return
+        t = Table(box=box.SIMPLE, show_header=True, header_style="green bold")
+        t.add_column("Model", style="bold")
+        t.add_column("gen tok/s", justify="right", style="green")
+        t.add_column("prompt tok/s", justify="right")
+        t.add_column("total(s)", justify="right")
+        t.add_column("tokens", justify="right")
+        t.add_column("時間")
+        for r in rows:
+            t.add_row(
+                r["model"], f"{r['gen_tps']:.1f}", f"{r['prompt_tps']:.1f}",
+                f"{r['total_s']:.2f}", str(r["eval_count"] or "-"), (r["created_at"] or "")[:16],
+            )
+        console.print(Panel(t, title="[green bold]Bench 歷史[/]", border_style="green"))
+        return
+
     _require_running(client)
     m = model or settings.default_model
     _do_bench(client, settings, m)
@@ -682,9 +822,19 @@ def _preset_save(
     top_p: Annotated[Optional[float], typer.Option("--top-p")] = None,
     top_k: Annotated[Optional[int], typer.Option("--top-k")] = None,
     stop: Annotated[Optional[list[str]], typer.Option("--stop")] = None,
+    repeat_penalty: Annotated[Optional[float], typer.Option("--repeat-penalty")] = None,
+    min_p: Annotated[Optional[float], typer.Option("--min-p")] = None,
+    seed: Annotated[Optional[int], typer.Option("--seed")] = None,
 ):
     settings = _settings()
-    settings.save_preset(name, model, system, temp, top_p, top_k, list(stop) if stop else None)
+    extra: dict = {}
+    if repeat_penalty is not None:
+        extra["repeat_penalty"] = repeat_penalty
+    if min_p is not None:
+        extra["min_p"] = min_p
+    if seed is not None:
+        extra["seed"] = seed
+    settings.save_preset(name, model, system, temp, top_p, top_k, list(stop) if stop else None, extra or None)
     console.print(f"[green]✓ preset [bold]{name}[/bold] 已儲存[/green]")
 
 
@@ -825,3 +975,63 @@ def _history_delete(
     else:
         console.print(f"[red]✗ 對話 #{conv_id} 不存在[/red]")
         raise typer.Exit(1)
+
+
+# ── gateway ───────────────────────────────────────────────────
+_gw_app = typer.Typer(help="閘道 IP 白名單管理")
+app.add_typer(_gw_app, name="gateway")
+
+
+@_gw_app.callback(invoke_without_command=True)
+def gw_default(ctx: typer.Context):
+    if ctx.invoked_subcommand is None:
+        _gw_list()
+
+
+@_gw_app.command("allow", help="加入允許的 IP/CIDR")
+def _gw_allow(
+    cidr: str,
+    note: Annotated[str, typer.Option("--note", "-n")] = "",
+):
+    settings = _settings()
+    try:
+        ok = settings.gateway_add_allow(cidr, note)
+    except ValueError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
+    if ok:
+        console.print(f"[green]已加入：{cidr}[/green]")
+        console.print("  [dim]重啟閘道生效：olm restart[/dim]")
+    else:
+        console.print(f"[yellow]{cidr} 已存在[/yellow]")
+
+
+@_gw_app.command("deny", help="移除允許的 IP/CIDR")
+def _gw_deny(cidr: str):
+    settings = _settings()
+    if settings.gateway_remove_allow(cidr):
+        console.print(f"[green]已移除：{cidr}[/green]")
+        console.print("  [dim]重啟閘道生效：olm restart[/dim]")
+    else:
+        console.print(f"[red]{cidr} 不在白名單中[/red]")
+        raise typer.Exit(1)
+
+
+@_gw_app.command("list", help="列出 IP 白名單")
+def _gw_list():
+    settings = _settings()
+    acl = settings.gateway_list_allow()
+    if not acl:
+        console.print("[yellow]（白名單為空——閘道僅 localhost 可用）[/yellow]")
+        console.print("  提示：olm gateway allow 192.168.0.176  # 允許特定 IP")
+        console.print("  提示：olm gateway allow 192.168.0.0/24  # 允許整個子網")
+        return
+    t = Table(box=box.SIMPLE, show_header=True, header_style="green bold")
+    t.add_column("CIDR", style="bold")
+    t.add_column("備注", style="dim")
+    t.add_column("加入時間")
+    for r in acl:
+        t.add_row(r["cidr"], r["note"] or "-", (r["created_at"] or "")[:16])
+    console.print(Panel(t, title="[green bold]閘道 IP 白名單[/]", border_style="green"))
+    gw_port = settings.gateway_port
+    console.print(f"  [dim]重啟閘道後，白名單 IP 可存取 :{gw_port}，其餘回 403[/dim]")

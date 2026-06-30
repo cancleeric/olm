@@ -190,6 +190,8 @@ def _do_bench(client: OllamaClient, settings: Settings, model: str):
     console.print(f"  prompt_eval : {pc} tokens, {pd_ns/1e9:.3f}s → {pr_tps:.1f} tok/s")
     console.print(f"  generation  : {ec} tokens, {ed/1e9:.3f}s → [green bold]{gen_tps:.1f} tok/s[/green bold]")
     console.print(f"  total       : {td/1e9:.3f}s")
+    settings.add_bench_result(model, gen_tps, pr_tps, td / 1e9, ec)
+    console.print(f"  [dim]已記錄到歷史（olm bench --history 查看）[/dim]")
 
 
 def _do_chat_repl(
@@ -233,6 +235,9 @@ def _do_chat_repl(
         console.print(f"  [dim]取樣參數：{options}[/dim]")
     if system:
         console.print(f"  [dim]system：{system[:80]}{'…' if len(system) > 80 else ''}[/dim]")
+
+    # 取模型 context 上限（G-B）
+    ctx_limit = client.model_max_ctx(model) or 0
 
     timeout = settings.chat_timeout
 
@@ -313,6 +318,17 @@ def _do_chat_repl(
                     tps = eval_count / (eval_duration / 1e9)
                     secs = eval_duration / 1e9
                     console.print(f"  [dim]⏱ {tps:.1f} tok/s · {eval_count} tokens · {secs:.2f}s[/dim]")
+
+                # Context 用量顯示（G-B）
+                prompt_eval = done_chunk.get("prompt_eval_count", 0) or 0
+                used_ctx = prompt_eval + (eval_count or 0)
+                if used_ctx:
+                    if ctx_limit:
+                        pct = used_ctx / ctx_limit * 100
+                        color = "red" if pct > 80 else "yellow" if pct > 60 else "dim"
+                        console.print(f"  [{color}]ctx: {used_ctx} / {ctx_limit} ({pct:.0f}%)[/{color}]")
+                    else:
+                        console.print(f"  [dim]ctx: {used_ctx} tokens[/dim]")
 
                 if tool_calls and mcp_client:
                     # 有工具呼叫，執行後繼續對話

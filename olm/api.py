@@ -162,10 +162,13 @@ class OllamaClient:
                 except json.JSONDecodeError:
                     continue
 
-    def load(self, model: str, ctx: int, keep_alive: str = "24h") -> bool:
+    def load(self, model: str, ctx: int, keep_alive: str = "24h", num_gpu: int | None = None) -> bool:
+        opts: dict = {"num_ctx": ctx}
+        if num_gpu is not None:
+            opts["num_gpu"] = num_gpu
         d = self._post(
             "/api/generate",
-            {"model": model, "keep_alive": keep_alive, "options": {"num_ctx": ctx}},
+            {"model": model, "keep_alive": keep_alive, "options": opts},
             timeout=300,
         )
         return d is not None and d.get("done") is True
@@ -330,6 +333,16 @@ class OllamaClient:
                 )
             raise RuntimeError(msg)
 
+        # 讀取 IP 白名單，加到閘道子程序參數
+        try:
+            from .db import Settings as _Settings
+            cidrs = _Settings().gateway_load_cidrs()
+        except Exception:
+            cidrs = []
+        args_extra: list[str] = []
+        for c in cidrs:
+            args_extra += ["--allow", c]
+
         with open(logfile, "a") as log:
             proc = subprocess.Popen(
                 [
@@ -338,6 +351,7 @@ class OllamaClient:
                     "--gateway-port", str(gateway_port),
                     "--ollama-port", str(ollama_port),
                     "--timeout", str(timeout),
+                    *args_extra,
                 ],
                 stdout=log,
                 stderr=log,

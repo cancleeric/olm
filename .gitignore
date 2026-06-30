@@ -7,3 +7,6 @@ build/
 venv/
 .env
 *.db
+
+# Claude Code worktrees/agent junk
+.claude/

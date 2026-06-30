@@ -175,12 +175,19 @@ def cmd_unload(model: Annotated[Optional[str], typer.Argument()] = None):
 # ── switch ────────────────────────────────────────────────────
 @app.command("switch", help="卸載 from_model，載入 to_model")
 def cmd_switch(
-    from_model: str,
-    to_model: str,
+    from_model: Annotated[Optional[str], typer.Argument()] = None,
+    to_model: Annotated[Optional[str], typer.Argument()] = None,
 ):
     client = _client()
     settings = _settings()
     _require_running(client)
+    loaded = [m["name"] for m in client.list_loaded()]
+    all_models = [m["name"] for m in client.list_models()]
+    from_model = from_model or _pick("卸載哪個模型", loaded, loaded[0] if loaded else "")
+    to_model = to_model or _pick("載入哪個模型", all_models, settings.default_model)
+    if not from_model or not to_model:
+        console.print("[red]✗ 請指定來源與目標模型[/red]")
+        raise typer.Exit(1)
     console.print(f"[yellow]▶ 卸載 {from_model}[/yellow]")
     client.unload(from_model)
     ctx = settings.effective_ctx(to_model)
@@ -221,6 +228,8 @@ def cmd_chat(
     no_stream: Annotated[bool, typer.Option("--no-stream", help="等完整回應再印")] = False,
     preset: Annotated[Optional[str], typer.Option("--preset", "-p", help="載入已存 preset")] = None,
     mcp: Annotated[Optional[str], typer.Option("--mcp", help="MCP server spec（npx:pkg/cmd:exe/python:mod）")] = None,
+    fmt: Annotated[Optional[str], typer.Option("--format", help="輸出格式（json）")] = None,
+    save: Annotated[Optional[str], typer.Option("--save", help="儲存對話歷史（給定名稱）")] = None,
 ):
     client = _client()
     settings = _settings()
@@ -276,6 +285,8 @@ def cmd_chat(
             options=options or None,
             no_stream=no_stream,
             mcp_client=mcp_client,
+            fmt=fmt,
+            save_name=save,
         )
     finally:
         if mcp_client:
@@ -427,8 +438,8 @@ def cmd_delete(
     yes: Annotated[bool, typer.Option("--yes", "-y", help="跳過確認")] = False,
 ):
     client = _client()
-    _require_running(client)
-    installed = [m["name"] for m in client.list_models()]
+    running = client.is_running()
+    installed = [m["name"] for m in (client.list_models() if running else client.disk_models())]
     if not installed:
         console.print("[yellow]⚠ 無已安裝的模型[/yellow]")
         return
@@ -441,6 +452,15 @@ def cmd_delete(
             console.print("[yellow]已取消[/yellow]")
             return
     console.print(f"[red]▶ 刪除 [bold]{m}[/bold][/red]")
+    if not running:
+        # fallback: 用 ollama CLI
+        result = subprocess.run(["ollama", "rm", m], capture_output=True, text=True)
+        if result.returncode == 0:
+            console.print(f"[green]✓ {m} 已刪除（離線模式）[/green]")
+        else:
+            console.print(f"[red]✗ {result.stderr.strip()}[/red]")
+            raise typer.Exit(1)
+        return
     ok = client.delete(m)
     if ok:
         console.print(f"[green]✓ {m} 已刪除[/green]")
@@ -597,6 +617,7 @@ def _config_get(key: str):
 
 @_config_app.command("set", help="改動設定值（num_ctx 支援 256K/1M）")
 def _config_set(key: str, value: str):
+    import re
     settings = _settings()
     if key == "num_ctx":
         p = parse_ctx(value)
@@ -605,6 +626,12 @@ def _config_set(key: str, value: str):
             raise typer.Exit(1)
         settings.set(key, str(p))
         console.print(f"[green]✓ {key} = {fmt_ctx(p)}[/green]")
+    elif key == "keep_alive":
+        if not re.match(r'^\d+[smhd]?$', value) and value != "-1":
+            console.print(f"[red]✗ keep_alive 格式無效（範例：24h、30m、3600s、-1）[/red]")
+            raise typer.Exit(1)
+        settings.set(key, value)
+        console.print(f"[green]✓ {key} = {value}[/green]")
     else:
         # 非 loopback 的 gateway_host 安全警告（仍允許寫入，但醒目提示）
         if key == "gateway_host" and value not in ("127.0.0.1", "::1", "localhost"):
@@ -692,4 +719,109 @@ def _preset_delete(name: str):
         console.print(f"[green]✓ preset [bold]{name}[/bold] 已刪除[/green]")
     else:
         console.print(f"[red]✗ preset '{name}' 不存在[/red]")
+        raise typer.Exit(1)
+
+
+# ── history ───────────────────────────────────────────────────
+_history_app = typer.Typer(help="對話歷史管理")
+app.add_typer(_history_app, name="history")
+
+
+@_history_app.callback(invoke_without_command=True)
+def history_default(ctx: typer.Context):
+    if ctx.invoked_subcommand is None:
+        _history_list()
+
+
+@_history_app.command("list", help="列出對話歷史")
+def _history_list(limit: int = 20):
+    settings = _settings()
+    convs = settings.list_conversations(limit)
+    if not convs:
+        console.print("[yellow]（無歷史對話）[/yellow]  提示：olm chat --save '對話名稱'")
+        return
+    t = Table(box=box.SIMPLE, show_header=True, header_style="green bold")
+    t.add_column("ID", justify="right", style="cyan")
+    t.add_column("名稱", style="bold")
+    t.add_column("模型")
+    t.add_column("訊息數", justify="right")
+    t.add_column("最後更新")
+    for c in convs:
+        t.add_row(
+            str(c["id"]), c["name"] or "-", c["model"] or "-",
+            str(c["msg_count"]), (c["updated_at"] or "")[:16],
+        )
+    console.print(Panel(t, title="[green bold]對話歷史[/]", border_style="green"))
+
+
+@_history_app.command("show", help="顯示對話內容")
+def _history_show(conv_id: int):
+    settings = _settings()
+    messages = settings.get_conversation_messages(conv_id)
+    if not messages:
+        console.print(f"[red]✗ 對話 #{conv_id} 不存在[/red]")
+        raise typer.Exit(1)
+    for m in messages:
+        role = m["role"]
+        label = {
+            "user": "[bold cyan][你][/]",
+            "assistant": "[bold green][AI][/]",
+            "system": "[dim][System][/]",
+            "tool": "[yellow][Tool][/]",
+        }.get(role, f"[{role}]")
+        console.print(f"{label} {m['content']}")
+
+
+@_history_app.command("export", help="匯出對話為 Markdown")
+def _history_export(
+    conv_id: int,
+    output: Annotated[Optional[str], typer.Option("--output", "-o")] = None,
+):
+    settings = _settings()
+    md = settings.export_conversation_md(conv_id)
+    if not md:
+        console.print(f"[red]✗ 對話 #{conv_id} 不存在[/red]")
+        raise typer.Exit(1)
+    if output:
+        with open(output, "w") as f:
+            f.write(md)
+        console.print(f"[green]✓ 已匯出到 {output}[/green]")
+    else:
+        console.print(md)
+
+
+@_history_app.command("search", help="搜尋對話歷史")
+def _history_search(keyword: str):
+    settings = _settings()
+    with settings._conn() as conn:
+        rows = conn.execute(
+            "SELECT c.id,c.name,c.model,m.role,m.content,m.created_at "
+            "FROM messages m JOIN conversations c ON c.id=m.conv_id "
+            "WHERE m.content LIKE ? ORDER BY m.created_at DESC LIMIT 20",
+            (f"%{keyword}%",),
+        ).fetchall()
+    if not rows:
+        console.print(f"[yellow]⚠ 找不到含「{keyword}」的訊息[/yellow]")
+        return
+    for r in rows:
+        role_label = {"user": "[cyan][你][/]", "assistant": "[green][AI][/]"}.get(r[3], f"[{r[3]}]")
+        match = r[4][:100].replace(keyword, f"[bold yellow]{keyword}[/]")
+        console.print(f"#{r[0]} {r[1] or '無名'} ({r[2]}) {role_label}: {match}")
+
+
+@_history_app.command("delete", help="刪除對話歷史")
+def _history_delete(
+    conv_id: int,
+    yes: Annotated[bool, typer.Option("--yes", "-y")] = False,
+):
+    settings = _settings()
+    if not yes:
+        confirm = input(f"確定刪除對話 #{conv_id}？[y/N] ").strip().lower()
+        if confirm != "y":
+            console.print("[yellow]已取消[/yellow]")
+            return
+    if settings.delete_conversation(conv_id):
+        console.print(f"[green]✓ 對話 #{conv_id} 已刪除[/green]")
+    else:
+        console.print(f"[red]✗ 對話 #{conv_id} 不存在[/red]")
         raise typer.Exit(1)

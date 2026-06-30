@@ -49,6 +49,24 @@ class Settings:
                     created_at TEXT DEFAULT (datetime('now'))
                 )
             """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS conversations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT,
+                    model TEXT,
+                    created_at TEXT DEFAULT (datetime('now')),
+                    updated_at TEXT DEFAULT (datetime('now'))
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    conv_id INTEGER REFERENCES conversations(id),
+                    role TEXT,
+                    content TEXT,
+                    created_at TEXT DEFAULT (datetime('now'))
+                )
+            """)
             for k, v in DEFAULTS.items():
                 conn.execute(
                     "INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (k, v)
@@ -195,6 +213,69 @@ class Settings:
         with self._conn() as conn:
             c = conn.execute("DELETE FROM presets WHERE name=?", (name,))
             return c.rowcount > 0
+
+    # ── Conversation history CRUD ────────────────────────────────────────────
+
+    def create_conversation(self, name: str | None, model: str) -> int:
+        with self._conn() as conn:
+            c = conn.execute(
+                "INSERT INTO conversations(name,model) VALUES(?,?)", (name, model)
+            )
+            return c.lastrowid
+
+    def add_message(self, conv_id: int, role: str, content: str):
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT INTO messages(conv_id,role,content) VALUES(?,?,?)", (conv_id, role, content)
+            )
+            conn.execute(
+                "UPDATE conversations SET updated_at=datetime('now') WHERE id=?", (conv_id,)
+            )
+
+    def list_conversations(self, limit: int = 20) -> list[dict]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT c.id,c.name,c.model,c.created_at,c.updated_at,COUNT(m.id) as msg_count "
+                "FROM conversations c LEFT JOIN messages m ON m.conv_id=c.id "
+                "GROUP BY c.id ORDER BY c.updated_at DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [
+            {"id": r[0], "name": r[1], "model": r[2],
+             "created_at": r[3], "updated_at": r[4], "msg_count": r[5]}
+            for r in rows
+        ]
+
+    def get_conversation_messages(self, conv_id: int) -> list[dict]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT role,content,created_at FROM messages WHERE conv_id=? ORDER BY id", (conv_id,)
+            ).fetchall()
+        return [{"role": r[0], "content": r[1], "created_at": r[2]} for r in rows]
+
+    def delete_conversation(self, conv_id: int) -> bool:
+        with self._conn() as conn:
+            conn.execute("DELETE FROM messages WHERE conv_id=?", (conv_id,))
+            c = conn.execute("DELETE FROM conversations WHERE id=?", (conv_id,))
+            return c.rowcount > 0
+
+    def export_conversation_md(self, conv_id: int) -> str | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT name,model,created_at FROM conversations WHERE id=?", (conv_id,)
+            ).fetchone()
+        if not row:
+            return None
+        name, model, created_at = row
+        messages = self.get_conversation_messages(conv_id)
+        lines = [f"# {name or f'Conversation {conv_id}'}", f"Model: {model} | Created: {created_at}", ""]
+        for m in messages:
+            role_label = {
+                "user": "**你**", "assistant": "**AI**",
+                "system": "**System**", "tool": "**Tool**",
+            }.get(m["role"], m["role"])
+            lines.append(f"{role_label}: {m['content']}")
+            lines.append("")
+        return "\n".join(lines)
 
 
 def parse_ctx(s: str) -> int | None:

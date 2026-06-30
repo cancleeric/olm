@@ -130,6 +130,7 @@ class OllamaClient:
         keep_alive: str = "24h",
         timeout: int = 21600,
         tools: list[dict] | None = None,
+        fmt: str | None = None,
     ):
         """串流 /api/chat NDJSON，每次 yield 一個 chunk dict。
         容錯：空行跳過、JSONDecodeError 跳過；連線/逾時錯誤向上拋。
@@ -143,6 +144,8 @@ class OllamaClient:
         }
         if tools:
             payload_dict["tools"] = tools
+        if fmt:
+            payload_dict["format"] = fmt
         payload = json.dumps(payload_dict).encode()
         req = urllib.request.Request(
             self.base_url + "/api/chat",

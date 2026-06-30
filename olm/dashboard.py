@@ -200,6 +200,8 @@ def _do_chat_repl(
     options: Optional[dict] = None,
     no_stream: bool = False,
     mcp_client=None,
+    fmt: str | None = None,
+    save_name: str | None = None,
 ) -> None:
     """多輪對話 REPL with optional MCP tool-calling。輸入 exit / /bye 或 Ctrl-D 結束。"""
     import json as _json
@@ -219,7 +221,14 @@ def _do_chat_repl(
             console.print(f"[yellow]MCP 工具載入失敗：{e}[/yellow]")
             tools = []
 
+    conv_id = None
+    if save_name:
+        conv_id = settings.create_conversation(save_name, model)
+        console.print(f"  [dim]歷史記錄中：#{conv_id} {save_name}[/dim]")
+
     console.print(f"\n[cyan]▶ 對話：[bold]{model}[/bold]  exit 或 /bye 離開，Ctrl-D 結束[/cyan]")
+    if fmt:
+        console.print(f"  [dim]輸出格式：{fmt}[/dim]")
     if options:
         console.print(f"  [dim]取樣參數：{options}[/dim]")
     if system:
@@ -243,28 +252,32 @@ def _do_chat_repl(
 
         # Tool call loop：model 可能連續呼叫多個工具
         turn_failed = False
+        full_content = ""
         while True:
             try:
                 full_content = ""
                 tool_calls: list = []
                 final_msg: dict = {}
+                done_chunk: dict = {}
 
-                if not no_stream:
+                if not no_stream and fmt != "json":
                     console.print("\n[bold green][AI][/bold green] ", end="", highlight=False)
 
                 for chunk in client.chat_stream(
                     model, messages, options=options,
                     tools=tools if tools else None,
                     timeout=timeout,
+                    fmt=fmt,
                 ):
                     msg = chunk.get("message", {})
                     if chunk.get("done"):
                         final_msg = msg
+                        done_chunk = chunk
                         break
                     content = msg.get("content", "")
                     if content:
                         full_content += content
-                        if not no_stream:
+                        if not no_stream and fmt != "json":
                             print(content, end="", flush=True)
                     # tool_calls 可能在 done=False 的 chunk 中出現
                     tc = msg.get("tool_calls")
@@ -276,10 +289,30 @@ def _do_chat_repl(
                     tool_calls = final_msg.get("tool_calls", [])
 
                 if not no_stream:
-                    print()
+                    if fmt != "json":
+                        print()
                 else:
-                    if full_content:
+                    if full_content and fmt != "json":
                         console.print(f"\n[bold green][AI][/bold green] {full_content}")
+
+                # JSON format: 語法高亮顯示
+                if fmt == "json" and full_content:
+                    console.print("\n[bold green][AI][/bold green]")
+                    try:
+                        from rich.syntax import Syntax
+                        parsed = _json.loads(full_content)
+                        pretty = _json.dumps(parsed, ensure_ascii=False, indent=2)
+                        console.print(Syntax(pretty, "json", theme="monokai"))
+                    except Exception:
+                        console.print(full_content)
+
+                # TPS 顯示
+                eval_count = done_chunk.get("eval_count", 0)
+                eval_duration = done_chunk.get("eval_duration", 0)
+                if eval_count and eval_duration:
+                    tps = eval_count / (eval_duration / 1e9)
+                    secs = eval_duration / 1e9
+                    console.print(f"  [dim]⏱ {tps:.1f} tok/s · {eval_count} tokens · {secs:.2f}s[/dim]")
 
                 if tool_calls and mcp_client:
                     # 有工具呼叫，執行後繼續對話
@@ -310,7 +343,7 @@ def _do_chat_repl(
                             console.print(f"[red]   -> {e}[/red]")
                         messages.append({"role": "tool", "content": result})
                     # 繼續迴圈讓 model 處理工具結果
-                    if not no_stream:
+                    if not no_stream and fmt != "json":
                         console.print("\n[bold green][AI][/bold green] ", end="", highlight=False)
                 else:
                     # 無工具呼叫，這一輪結束
@@ -323,7 +356,10 @@ def _do_chat_repl(
                 break
 
         if turn_failed:
-            messages.pop()  # 移除未得到回應的 user message
+            messages.pop()
+        elif conv_id and full_content:
+            settings.add_message(conv_id, "user", user_input)
+            settings.add_message(conv_id, "assistant", full_content)  # 移除未得到回應的 user message
 
 
 def _settings_menu(client: OllamaClient, settings: Settings):

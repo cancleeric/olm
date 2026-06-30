@@ -34,6 +34,10 @@ def _make_handler(ollama_url: str, timeout: int):
             pass  # 靜音，避免污染 stderr
 
         def _forward(self):
+            # SSRF 守衛：路徑必須以 / 開頭，防 GET @evil.com/ 被 urllib 解析成 userinfo@host
+            if not self.path.startswith("/"):
+                self.send_error(400, "Bad path")
+                return
             target = self._up + self.path
 
             # 只在有 Content-Length 時讀 body（GET/HEAD 通常無 body，避免 blocking）

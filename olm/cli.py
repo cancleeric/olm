@@ -10,7 +10,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich import box
 
-from .api import OllamaClient, LOGFILE, _sysmem
+from .api import OllamaClient, LOGFILE, GATEWAY_LOGFILE, _sysmem
 from .db import Settings, parse_ctx, fmt_ctx
 from .dashboard import run_dashboard, _do_bench, _pick, _do_chat_repl
 
@@ -204,6 +204,8 @@ def cmd_run(model: Annotated[Optional[str], typer.Argument()] = None):
     console.print(f"[cyan]▶ 互動模式：[bold]{m}[/bold]  ctx={fmt_ctx(ctx)}[/cyan]")
     env = os.environ.copy()
     env["OLLAMA_NUM_CTX"] = str(ctx)
+    # 直連 Ollama 私有埠，繞過閘道（閘道掛了也不影響 run）
+    env["OLLAMA_HOST"] = f"http://127.0.0.1:{settings.ollama_port}"
     subprocess.run(["ollama", "run", m], env=env)
 
 
@@ -248,35 +250,46 @@ def cmd_start():
     import time
     client = _client()
     settings = _settings()
-    if client.is_running():
-        console.print(f"[yellow]⚠ 服務已在 {client.base_url} 運行[/yellow]")
-        return
     ollama_port = settings.ollama_port
     gw_host = settings.gateway_host
     gw_port = settings.gateway_port
 
-    # 1. 起 Ollama（私有埠 11551）
-    console.print(f"[cyan]▶ 背景啟動 Ollama port={ollama_port}（私有，只綁 127.0.0.1）[/cyan]")
-    pid = client.start_server(ollama_port, settings.num_ctx, settings.keep_alive)
-    for _ in range(15):
-        time.sleep(1)
-        if client.is_running():
-            break
-    else:
-        console.print("[red]✗ Ollama 啟動逾時[/red]")
-        raise typer.Exit(1)
-    console.print(f"[green]✓ Ollama 就緒 PID={pid}（首次推論才載入模型）[/green]")
-
-    # 2. 起閘道（公開 127.0.0.1:11434，外網打不進來）
-    console.print(f"[cyan]▶ 啟動閘道 {gw_host}:{gw_port} → :ollama:{ollama_port}[/cyan]")
-    client.start_gateway(gw_host, gw_port, ollama_port, settings.chat_timeout)
-    time.sleep(1)  # 等 pidfile 寫入
+    # 分別判斷 Ollama（私有埠）與閘道，允許部分恢復
+    ol_running = client.is_running()
     gw_pid = client.gateway_pid(gw_port)
-    if gw_pid:
-        console.print(f"[green]✓ 閘道就緒 PID={gw_pid}  127.0.0.1:{gw_port}（外網即斷）[/green]")
+
+    if ol_running and gw_pid:
+        console.print(f"[yellow]⚠ Ollama(:{ollama_port}) 與閘道(:{gw_port}) 皆已運行[/yellow]")
+        return
+
+    if not ol_running:
+        # 1. 起 Ollama（私有埠，只綁 127.0.0.1）
+        console.print(f"[cyan]▶ 背景啟動 Ollama port={ollama_port}（私有，只綁 127.0.0.1）[/cyan]")
+        pid = client.start_server(ollama_port, settings.num_ctx, settings.keep_alive)
+        for _ in range(15):
+            time.sleep(1)
+            if client.is_running():
+                break
+        else:
+            console.print("[red]✗ Ollama 啟動逾時[/red]")
+            raise typer.Exit(1)
+        console.print(f"[green]✓ Ollama 就緒 PID={pid}（首次推論才載入模型）[/green]")
     else:
-        console.print("[red]✗ 閘道啟動失敗[/red]")
-        raise typer.Exit(1)
+        console.print(f"[yellow]Ollama 已在 :{ollama_port} 運行，跳過啟動[/yellow]")
+
+    if not gw_pid:
+        # 2. 起閘道（127.0.0.1:11434，外網打不進來）
+        console.print(f"[cyan]▶ 啟動閘道 {gw_host}:{gw_port} → Ollama:{ollama_port}[/cyan]")
+        client.start_gateway(gw_host, gw_port, ollama_port, settings.chat_timeout)
+        time.sleep(1)  # 等 pidfile 寫入
+        gw_pid = client.gateway_pid(gw_port)
+        if gw_pid:
+            console.print(f"[green]✓ 閘道就緒 PID={gw_pid}  127.0.0.1:{gw_port}（外網即斷）[/green]")
+        else:
+            console.print("[red]✗ 閘道啟動失敗[/red]")
+            raise typer.Exit(1)
+    else:
+        console.print(f"[yellow]閘道已在 :{gw_port} 運行，跳過啟動[/yellow]")
 
 
 # ── stop ──────────────────────────────────────────────────────
@@ -327,6 +340,9 @@ def cmd_restart():
     client.start_gateway(gw_host, gw_port, ollama_port, settings.chat_timeout)
     time.sleep(1)
     gw_pid = client.gateway_pid(gw_port)
+    if not gw_pid:
+        console.print("[red]✗ 閘道重啟失敗[/red]")
+        raise typer.Exit(1)
     console.print(f"[green]✓ 重啟完成 閘道 PID={gw_pid} / Ollama PID={pid}[/green]")
 
 
@@ -406,9 +422,18 @@ def cmd_info(model: str):
 
 
 # ── logs ──────────────────────────────────────────────────────
-@app.command("logs", help="查看背景服務日誌")
-def cmd_logs():
-    subprocess.run(["tail", "-40", LOGFILE])
+@app.command("logs", help="查看背景服務日誌（Ollama + 閘道）")
+def cmd_logs(
+    gateway: Annotated[bool, typer.Option("--gateway", "-g", help="只看閘道日誌")] = False,
+):
+    if gateway:
+        console.print(f"[dim]── 閘道日誌 {GATEWAY_LOGFILE} ──[/dim]")
+        subprocess.run(["tail", "-40", GATEWAY_LOGFILE])
+    else:
+        console.print(f"[dim]── Ollama 日誌 {LOGFILE} ──[/dim]")
+        subprocess.run(["tail", "-30", LOGFILE])
+        console.print(f"\n[dim]── 閘道日誌 {GATEWAY_LOGFILE} ──[/dim]")
+        subprocess.run(["tail", "-10", GATEWAY_LOGFILE])
 
 
 # ── bench ─────────────────────────────────────────────────────
@@ -438,7 +463,8 @@ def _config_list():
     t = Table(box=box.SIMPLE, show_header=True, header_style="green bold")
     t.add_column("key", style="bold")
     t.add_column("value")
-    for k in ["num_ctx", "keep_alive", "request_timeout", "chat_timeout", "default_model"]:
+    for k in ["num_ctx", "keep_alive", "request_timeout", "chat_timeout", "default_model",
+               "ollama_port", "gateway_host", "gateway_port"]:
         v = settings.get(k)
         display = fmt_ctx(int(v)) if k == "num_ctx" else v
         t.add_row(k, display)
@@ -471,6 +497,13 @@ def _config_set(key: str, value: str):
         settings.set(key, str(p))
         console.print(f"[green]✓ {key} = {fmt_ctx(p)}[/green]")
     else:
+        # 非 loopback 的 gateway_host 安全警告（仍允許寫入，但醒目提示）
+        if key == "gateway_host" and value not in ("127.0.0.1", "::1", "localhost"):
+            console.print(
+                f"[bold yellow]⚠ 警告：gateway_host={value} 為非 loopback 位址。\n"
+                "  LAN 白名單政策未啟用前，外機將可直達閘道，破壞本機隔離。\n"
+                "  下一輪 LAN 政策輪完成前，強烈建議維持 127.0.0.1。[/bold yellow]"
+            )
         settings.set(key, value)
         console.print(f"[green]✓ {key} = {value}[/green]")
 

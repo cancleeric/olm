@@ -291,7 +291,35 @@ class OllamaClient:
         timeout: int = 21600,
         logfile: str = GATEWAY_LOGFILE,
     ) -> Optional[int]:
-        """背景啟動閘道子程序（-m olm.gateway），回傳子程序 PID。"""
+        """背景啟動閘道子程序（-m olm.gateway），回傳子程序 PID。
+        啟動前檢查埠是否已被佔用，友善提示（含 Ollama.app 偵測）。
+        """
+        try:
+            occupant = subprocess.check_output(
+                ["lsof", "-t", f"-iTCP:{gateway_port}", "-sTCP:LISTEN", "-Pn"],
+                stderr=subprocess.DEVNULL,
+            ).decode().strip()
+        except subprocess.CalledProcessError:
+            occupant = ""
+
+        if occupant:
+            pid_str = occupant.split()[0]
+            # 查程序名，判斷是否 Ollama.app
+            try:
+                pname = subprocess.check_output(
+                    ["ps", "-p", pid_str, "-o", "comm="],
+                    stderr=subprocess.DEVNULL,
+                ).decode().strip()
+            except Exception:
+                pname = "unknown"
+            msg = f"埠 {gateway_port} 已被 PID={pid_str}({pname}) 佔用"
+            if "ollama" in pname.lower():
+                msg += (
+                    f"\n偵測到 Ollama.app 正佔用 {gateway_port}，"
+                    "請從選單列退出 Ollama.app 後再 olm start"
+                )
+            raise RuntimeError(msg)
+
         with open(logfile, "a") as log:
             proc = subprocess.Popen(
                 [

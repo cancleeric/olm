@@ -13,7 +13,7 @@ from rich import box
 
 from .api import OllamaClient, LOGFILE, GATEWAY_LOGFILE, _sysmem
 from .db import Settings, parse_ctx, fmt_ctx
-from .dashboard import run_dashboard, _do_bench, _pick, _do_chat_repl, _show_tag_picker
+from .dashboard import run_dashboard, _do_bench, _pick, _do_chat_repl, _show_tag_picker, _fmt_expires, _quant_label
 
 app = typer.Typer(
     name="olm",
@@ -166,10 +166,27 @@ def cmd_list():
     t.add_column("Model", style="bold")
     t.add_column("Size", justify="right")
     t.add_column("支援 ctx")
+    t.add_column("Q", style="dim", justify="center")
+    t.add_column("fits?", justify="center")
+
+    _, _, free_b = _sysmem()
+
+    def _fits_str(size_bytes: int, free_bytes) -> str:
+        if free_bytes is None or size_bytes == 0:
+            return "?"
+        if size_bytes < free_bytes * 0.7:
+            return "[green]✓[/green]"
+        if size_bytes < free_bytes:
+            return "[yellow]![/yellow]"
+        return "[red]✗[/red]"
 
     for i, m in enumerate(models, 1):
         ctx_col = fmt_ctx(client.model_max_ctx(m["name"])) if running else "?"
-        t.add_row(str(i), m["name"], f"{_gb(m.get('size', 0)):.1f} GB", ctx_col)
+        t.add_row(
+            str(i), m["name"], f"{_gb(m.get('size', 0)):.1f} GB", ctx_col,
+            _quant_label(m["name"]),
+            _fits_str(m.get("size", 0), free_b),
+        )
 
     console.print(Panel(t, title=f"[green bold]Installed Models[/]{hint}", border_style="green"))
 
@@ -219,7 +236,7 @@ def cmd_status():
         warn = ""
         if actual and actual < settings.effective_ctx(m["name"]):
             warn = " [yellow]⚠ 降載[/]"
-        t.add_row(m["name"], f"{_gb(sz):.1f} GB", vram_col, gpu_col, ctx_str + warn, m.get("expires_at", "?")[:19])
+        t.add_row(m["name"], f"{_gb(sz):.1f} GB", vram_col, gpu_col, ctx_str + warn, _fmt_expires(m.get("expires_at", "?")))
 
     console.print(Panel(t, title="[green bold]Loaded Models[/]", border_style="green"))
 
@@ -526,9 +543,14 @@ def cmd_restart():
 def cmd_pull(
     model: Annotated[str, typer.Argument(help="模型名稱（含 tag）")],
     no_check: Annotated[bool, typer.Option("--no-check", help="略過硬體相容性檢查")] = False,
+    no_pick: Annotated[bool, typer.Option("--no-pick", help="跳過 tag 選擇（腳本用途）")] = False,
 ):
     client = _client()
     _require_running(client)
+    # 無 tag 時顯示可用版本選單（僅互動 TTY，stdin+stdout 都需是 TTY）
+    import sys as _sys
+    if ":" not in model and not no_pick and _sys.stdin.isatty() and _sys.stdout.isatty():
+        model = _show_tag_picker(model)
     if not no_check:
         _show_compat(model)
     console.print(f"[cyan]▶ 下載 [bold]{model}[/bold][/cyan]")
@@ -557,8 +579,11 @@ def cmd_delete(
             return
     console.print(f"[red]▶ 刪除 [bold]{m}[/bold][/red]")
     if not running:
-        # fallback: 用 ollama CLI
-        result = subprocess.run(["ollama", "rm", m], capture_output=True, text=True)
+        # fallback: 用 ollama CLI（指定設定的 port）
+        import os as _os
+        _env = _os.environ.copy()
+        _env["OLLAMA_HOST"] = f"http://127.0.0.1:{settings.ollama_port}"
+        result = subprocess.run(["ollama", "rm", m], capture_output=True, text=True, env=_env)
         if result.returncode == 0:
             console.print(f"[green]✓ {m} 已刪除（離線模式）[/green]")
         else:
@@ -634,6 +659,15 @@ def cmd_search(
     if not results:
         console.print("[yellow]無結果（ollama.com 可能已改版，或關鍵字無符合）[/yellow]")
         return
+    # 取已安裝清單（服務未啟動時改讀磁碟）
+    installed_names: set = set()
+    try:
+        if client.is_running():
+            installed_names = {m["name"].split(":")[0] for m in client.list_models()}
+        else:
+            installed_names = {m["name"].split(":")[0] for m in client.disk_models()}
+    except Exception:
+        pass
     t = Table(box=box.SIMPLE, show_header=True, header_style="green bold")
     t.add_column("#", justify="right", style="cyan")
     t.add_column("Model", style="bold")
@@ -646,13 +680,16 @@ def cmd_search(
     for i, r in enumerate(results, 1):
         sizes_str = " ".join(r["sizes"]) or "-"
         caps_str = " ".join(r["capabilities"]) or "-"
+        rname = r["name"]
+        name_col = rname + (" [green]✓[/green]" if rname.split(":")[0] in installed_names else "")
         t.add_row(
-            str(i), r["name"], r["pulls"], r["tags"],
+            str(i), name_col, r["pulls"], r["tags"],
             sizes_str, caps_str, r["updated"], r["description"][:80],
         )
     console.print(Panel(t, title=f"[green bold]搜尋結果：{keyword}[/]", border_style="green"))
     console.print(f"  [dim]提示：olm pull <model>:<tag> 下載模型[/dim]")
-    if results:
+    import sys as _sys
+    if results and _sys.stdin.isatty() and _sys.stdout.isatty():
         try:
             console.print("\n[dim]輸入編號直接 pull（或 Enter 略過）[/dim]")
             choice = input("  > ").strip()
@@ -921,26 +958,50 @@ def _history_list(limit: int = 20):
 
 
 @_history_app.command("show", help="顯示對話內容")
-def _history_show(conv_id: int):
+def _history_show(
+    conv_id: int,
+    last: Annotated[Optional[int], typer.Option("--last", "-n", help="只顯示最後 N 輪訊息")] = None,
+):
     settings = _settings()
     messages = settings.get_conversation_messages(conv_id)
     if not messages:
         console.print(f"[red]✗ 對話 #{conv_id} 不存在[/red]")
         raise typer.Exit(1)
-    for msg in messages:
-        role = msg.get("role", "")
-        content = msg.get("content", "")
-        if role == "user":
-            console.print(f"\n[bold cyan]你[/bold cyan]")
-            console.print(content)
-        elif role == "assistant":
-            console.print(Rule(style="dim"))
-            console.print(f"[bold green]AI[/bold green]")
-            console.print(content)
-        elif role == "system":
-            console.print(f"\n[dim][System] {content[:80]}{'…' if len(content) > 80 else ''}[/dim]")
-        elif role == "tool":
-            console.print(f"\n[yellow][Tool][/yellow] {content[:120]}{'…' if len(content) > 120 else ''}")
+
+    if last is not None and last <= 0:
+        console.print("[red]--last 必須為正整數[/red]")
+        raise typer.Exit(1)
+    if last:
+        # 從最後 N 個 user turn 開始截取（保留 system，tool 也包含）
+        sys_msgs = [m for m in messages if m.get("role") == "system"]
+        non_sys = [m for m in messages if m.get("role") != "system"]
+        user_indices = [i for i, m in enumerate(non_sys) if m.get("role") == "user"]
+        if len(user_indices) > last:
+            messages = sys_msgs + non_sys[user_indices[-last]:]
+        else:
+            messages = sys_msgs + non_sys
+
+    def _render_messages(msgs):
+        for msg in msgs:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            if role == "user":
+                console.print(f"\n[bold cyan]你[/bold cyan]")
+                console.print(content)
+            elif role == "assistant":
+                console.print(Rule(style="dim"))
+                console.print(f"[bold green]AI[/bold green]")
+                console.print(content)
+            elif role == "system":
+                console.print(f"\n[dim][System] {content[:80]}{'…' if len(content) > 80 else ''}[/dim]")
+            elif role == "tool":
+                console.print(f"\n[yellow][Tool][/yellow] {content[:120]}{'…' if len(content) > 120 else ''}")
+
+    if sys.stdout.isatty() and len(messages) > 10:
+        with console.pager():
+            _render_messages(messages)
+    else:
+        _render_messages(messages)
 
 
 @_history_app.command("export", help="匯出對話為 Markdown")

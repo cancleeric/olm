@@ -289,13 +289,13 @@ class Settings:
             if model:
                 rows = conn.execute(
                     "SELECT model,gen_tps,prompt_tps,total_s,eval_count,created_at"
-                    " FROM bench_history WHERE model=? ORDER BY created_at DESC LIMIT ?",
+                    " FROM bench_history WHERE model=? ORDER BY id DESC LIMIT ?",
                     (model, limit),
                 ).fetchall()
             else:
                 rows = conn.execute(
                     "SELECT model,gen_tps,prompt_tps,total_s,eval_count,created_at"
-                    " FROM bench_history ORDER BY created_at DESC LIMIT ?",
+                    " FROM bench_history ORDER BY id DESC LIMIT ?",
                     (limit,),
                 ).fetchall()
         return [

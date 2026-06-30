@@ -502,3 +502,33 @@ def search_models(keyword: str, limit: int = 20) -> list[dict]:
         if len(results) >= limit:
             break
     return results
+
+
+def fetch_model_tags(model_base: str) -> list[dict]:
+    """從 ollama.com/library/<model>/tags 爬取可用 tag 和大小。回傳 [{"tag": "7b", "size": "4.1 GB"}, ...]"""
+    import urllib.parse
+    name = model_base.split(":")[0]  # 去掉 tag
+    url = f"https://ollama.com/library/{urllib.parse.quote(name)}/tags"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "olm/0.1", "HX-Request": "true"})
+        with urllib.request.urlopen(req, timeout=8) as r:
+            html = r.read().decode("utf-8", errors="replace")
+    except Exception:
+        return []
+    tags = []
+    tag_re = re.compile(r'href="/library/' + re.escape(name) + r':([^"]+)"')
+    size_re = re.compile(r'([\d.]+\s*(?:GB|MB|KB))', re.IGNORECASE)
+    lines = html.split('\n')
+    for i, line in enumerate(lines):
+        m = tag_re.search(line)
+        if m:
+            tag = m.group(1)
+            size = ""
+            for j in range(i, min(i + 5, len(lines))):
+                sm = size_re.search(lines[j])
+                if sm:
+                    size = sm.group(1)
+                    break
+            if tag and ":" not in tag:
+                tags.append({"tag": tag, "size": size})
+    return tags[:20]

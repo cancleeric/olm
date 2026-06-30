@@ -137,6 +137,8 @@ def _pick(prompt: str, options: list[str], default: str = "") -> str:
             return options[idx - 1]
     except ValueError:
         pass
+    if choice and not choice.isdigit():
+        console.print(f"[yellow]無效選擇，使用預設：{default or options[0]}[/yellow]")
     return default or options[0]
 
 
@@ -486,6 +488,31 @@ def _quant_label(name: str) -> str:
     return ""
 
 
+def _show_tag_picker(model_base: str) -> str:
+    """顯示可用 tag 列表，讓用戶選擇，回傳完整 model:tag。"""
+    from .api import fetch_model_tags
+    base = model_base.split(":")[0]
+    if ":" in model_base:
+        return model_base  # 已有 tag，直接用
+    console.print(f"[dim]查詢 {base} 可用 tag…[/dim]")
+    tags = fetch_model_tags(base)
+    if not tags:
+        return model_base  # 無法取得，原樣回傳
+    t = Table(box=box.SIMPLE, show_header=True, header_style="cyan bold")
+    t.add_column("#", justify="right", style="cyan")
+    t.add_column("Tag", style="bold")
+    t.add_column("Size", justify="right")
+    for i, tg in enumerate(tags, 1):
+        t.add_row(str(i), tg["tag"], tg["size"])
+    console.print(t)
+    choice = input("  選擇 tag（Enter 使用 latest）: ").strip()
+    if choice.isdigit():
+        idx = int(choice) - 1
+        if 0 <= idx < len(tags):
+            return f"{base}:{tags[idx]['tag']}"
+    return f"{base}:latest"
+
+
 def _dash_pull(client: "OllamaClient", model: str) -> None:
     """Dashboard 用的 pull，帶 Rich 進度條。"""
     from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, DownloadColumn, TransferSpeedColumn
@@ -710,6 +737,22 @@ def _do_chat_repl(
             else:
                 console.print(f"[dim]已在記錄中：#{conv_id}（後續訊息自動儲存）[/dim]")
             continue
+        if user_input.strip() in ("/help", "/?"):
+            console.print(Panel(
+                "\n".join([
+                    "[bold]/bye[/bold]         離開對話",
+                    "[bold]/ctx[/bold] [n]     調整 context 視窗（無參數開 picker）",
+                    "[bold]/clear[/bold]       清除對話記錄（保留 system prompt）",
+                    "[bold]/model[/bold] [名]  切換模型（無參數開 picker）",
+                    "[bold]/temp[/bold] [0~2]  調整 temperature",
+                    "[bold]/system[/bold] [p]  更新 system prompt（無參數多行輸入）",
+                    "[bold]/save[/bold] [名]   開始儲存此對話到歷史記錄",
+                    "[bold]/help[/bold]        顯示此說明",
+                ]),
+                title="[green]Chat 指令說明[/]",
+                border_style="green",
+            ))
+            continue
         if user_input.lower() in ("exit", "/bye"):
             console.print("[yellow]再見[/yellow]")
             break
@@ -873,6 +916,7 @@ def _settings_menu(client: OllamaClient, settings: Settings):
             if p:
                 settings.set("num_ctx", str(p))
                 console.print(f"[green]✓ num_ctx = {fmt_ctx(p)}[/green]")
+                continue
             else:
                 console.print("[red]✗ 無效數值[/red]")
         elif choice == "2":
@@ -880,11 +924,13 @@ def _settings_menu(client: OllamaClient, settings: Settings):
             if v:
                 settings.set("keep_alive", v)
                 console.print(f"[green]✓ keep_alive = {v}[/green]")
+                continue
         elif choice == "3":
             v = input("  新的 request_timeout (秒): ").strip()
             if v.isdigit():
                 settings.set("request_timeout", v)
                 console.print(f"[green]✓ request_timeout = {v}s[/green]")
+                continue
             else:
                 console.print("[red]✗ 需整數[/red]")
         elif choice == "4":
@@ -892,6 +938,7 @@ def _settings_menu(client: OllamaClient, settings: Settings):
             if v.isdigit():
                 settings.set("chat_timeout", v)
                 console.print(f"[green]✓ chat_timeout = {v}s[/green]")
+                continue
             else:
                 console.print("[red]✗ 需整數[/red]")
         elif choice == "5":
@@ -903,6 +950,7 @@ def _settings_menu(client: OllamaClient, settings: Settings):
             if model:
                 settings.set("default_model", model)
                 console.print(f"[green]✓ default_model = {model}[/green]")
+                continue
         elif choice == "6":
             names = [m["name"] for m in client.list_models()] if client.is_running() else []
             if names:
@@ -915,6 +963,7 @@ def _settings_menu(client: OllamaClient, settings: Settings):
                 if p:
                     settings.set_model_ctx(model, p)
                     console.print(f"[green]✓ {model} ctx = {fmt_ctx(p)}[/green]")
+                    continue
                 else:
                     console.print("[red]✗ 無效數值[/red]")
         elif choice == "7":
@@ -927,6 +976,7 @@ def _settings_menu(client: OllamaClient, settings: Settings):
                 if model:
                     settings.del_model_ctx(model)
                     console.print(f"[green]✓ 已清除 {model} 專屬設定[/green]")
+                    continue
         elif choice in ("b", ""):
             break
         else:
@@ -938,6 +988,18 @@ def run_dashboard(client: OllamaClient, settings: Settings):
     while True:
         settings._init()  # reload from DB
         _render_dashboard(client, settings)
+        # P4: onboarding — 首次/空白狀態提示
+        _r = client.is_running()
+        _ml = client.list_models() if _r else client.disk_models()
+        if not _r and len(_ml) == 0:
+            console.print(Panel(
+                "[bold]入門步驟：[/bold]\n"
+                "  [cyan]1[/cyan] 或 [cyan]7[/cyan]  啟動 Ollama 服務\n"
+                "  [cyan]f[/cyan]       搜尋並下載模型\n"
+                "  [cyan]5[/cyan]       開始對話",
+                title="[yellow]首次使用[/]",
+                border_style="yellow",
+            ))
         action = input("\nSelect action: ").strip().lower()
 
         if action == "q":
@@ -986,10 +1048,10 @@ def run_dashboard(client: OllamaClient, settings: Settings):
                 client.stop_server(ollama_port)
                 time.sleep(1)
                 pid = client.start_server(ollama_port, settings.num_ctx, settings.keep_alive)
-                for _ in range(15):
-                    time.sleep(1)
-                    if client.is_running():
-                        break
+                if _wait_ollama(client, timeout=15):
+                    console.print("[green]✓ Ollama 已就緒[/green]")
+                else:
+                    console.print("[red]✗ 重啟逾時[/red]")
                 client.start_gateway(gw_host, gw_port, ollama_port, settings.chat_timeout)
                 time.sleep(1)
                 gw_pid = client.gateway_pid(gw_port)
@@ -1081,23 +1143,44 @@ def run_dashboard(client: OllamaClient, settings: Settings):
                         else:
                             console.print("[red]✗ 啟動失敗，請查 olm logs[/red]")
                 if running:
-                    console.print("[dim]（不知道模型名稱？先按 f 搜尋 Ollama 模型庫）[/dim]")
-                    model = input("  輸入要下載的模型名稱: ").strip()
+                    console.print("[dim]（直接 Enter 可開啟搜尋，或輸入模型名稱）[/dim]")
+                    model = input("  輸入模型名稱: ").strip()
+                    if not model:
+                        keyword = input("  搜尋關鍵字: ").strip()
+                        if keyword:
+                            from .api import search_models
+                            try:
+                                results = search_models(keyword, 15)
+                            except ConnectionError as e:
+                                console.print(f"[red]{e}[/red]")
+                                results = []
+                            if results:
+                                installed_names = {m["name"].split(":")[0] for m in client.list_models()}
+                                st = Table(box=box.SIMPLE, show_header=True, header_style="green bold")
+                                st.add_column("#", justify="right", style="cyan")
+                                st.add_column("Model", style="bold")
+                                st.add_column("Pulls")
+                                st.add_column("Sizes")
+                                for i, r in enumerate(results, 1):
+                                    rname = r["name"]
+                                    name_col = rname + (" [green]✓已安裝[/green]" if rname.split(":")[0] in installed_names else "")
+                                    st.add_row(str(i), name_col, r["pulls"], " ".join(r["sizes"]) or "-")
+                                console.print(Panel(st, title=f"[green bold]搜尋：{keyword}[/]", border_style="green"))
+                                choice = input("  輸入編號下載（Enter 略過）: ").strip()
+                                if choice.isdigit():
+                                    idx = int(choice) - 1
+                                    if 0 <= idx < len(results):
+                                        model = results[idx]["name"]
+                            else:
+                                console.print("[yellow]無結果[/yellow]")
                     if model:
+                        model = _show_tag_picker(model)
                         _dash_pull(client, model)
 
             elif action == "7":
                 if not running:
-                    console.print("[yellow]⚠ Ollama 未啟動[/yellow]")
-                    start_ans = input("  是否立即啟動？[y/N] ").strip().lower()
-                    if start_ans in ("y", "yes"):
-                        client.start_server(settings.ollama_port, settings.num_ctx, settings.keep_alive)
-                        if _wait_ollama(client, timeout=20):
-                            running = True
-                            console.print("[green]✓ Ollama 已就緒[/green]")
-                        else:
-                            console.print("[red]✗ 啟動失敗，請查 olm logs[/red]")
-                if running:
+                    console.print("[yellow]服務未啟動，記憶體中無模型可卸載[/yellow]")
+                else:
                     loaded = [m["name"] for m in client.list_loaded()]
                     if not loaded:
                         console.print("[yellow]⚠ 目前沒有已載入的模型[/yellow]")
@@ -1182,14 +1265,26 @@ def run_dashboard(client: OllamaClient, settings: Settings):
                                 title=f"[green bold]搜尋：{keyword}[/]",
                                 border_style="green",
                             ))
-                            if running:
-                                console.print("\n[dim]輸入編號直接下載，或 Enter 返回[/dim]")
-                                choice = input("  > ").strip()
-                                if choice.isdigit():
-                                    idx = int(choice) - 1
-                                    if 0 <= idx < len(results[:15]):
-                                        model_name = results[idx]["name"]
-                                        console.print(f"[cyan]▶ 下載 {model_name}...[/cyan]")
+                            console.print("\n[dim]輸入編號直接下載，或 Enter 返回[/dim]")
+                            choice = input("  > ").strip()
+                            if choice.isdigit():
+                                idx = int(choice) - 1
+                                if 0 <= idx < len(results[:15]):
+                                    model_name = results[idx]["name"]
+                                    console.print(f"[cyan]▶ 下載 {model_name}...[/cyan]")
+                                    if not running:
+                                        start_ans = input("  Ollama 未啟動，是否立即啟動？[y/N] ").strip().lower()
+                                        if start_ans in ("y", "yes"):
+                                            client.start_server(settings.ollama_port, settings.num_ctx, settings.keep_alive)
+                                            if _wait_ollama(client, timeout=20):
+                                                running = True
+                                            else:
+                                                console.print("[red]✗ 啟動失敗[/red]")
+                                                model_name = ""
+                                        else:
+                                            model_name = ""
+                                    if model_name:
+                                        model_name = _show_tag_picker(model_name)
                                         _dash_pull(client, model_name)
 
             elif action == "g":

@@ -7,12 +7,13 @@ from typing import Annotated, Optional
 import typer
 from rich.console import Console
 from rich.panel import Panel
+from rich.rule import Rule
 from rich.table import Table
 from rich import box
 
 from .api import OllamaClient, LOGFILE, GATEWAY_LOGFILE, _sysmem
 from .db import Settings, parse_ctx, fmt_ctx
-from .dashboard import run_dashboard, _do_bench, _pick, _do_chat_repl
+from .dashboard import run_dashboard, _do_bench, _pick, _do_chat_repl, _show_tag_picker
 
 app = typer.Typer(
     name="olm",
@@ -658,7 +659,8 @@ def cmd_search(
             if choice.isdigit():
                 idx = int(choice) - 1
                 if 0 <= idx < len(results):
-                    _do_pull(client, results[idx]["name"])
+                    model_to_pull = _show_tag_picker(results[idx]["name"])
+                    _do_pull(client, model_to_pull)
         except (EOFError, KeyboardInterrupt):
             pass
 
@@ -925,15 +927,20 @@ def _history_show(conv_id: int):
     if not messages:
         console.print(f"[red]✗ 對話 #{conv_id} 不存在[/red]")
         raise typer.Exit(1)
-    for m in messages:
-        role = m["role"]
-        label = {
-            "user": "[bold cyan][你][/]",
-            "assistant": "[bold green][AI][/]",
-            "system": "[dim][System][/]",
-            "tool": "[yellow][Tool][/]",
-        }.get(role, f"[{role}]")
-        console.print(f"{label} {m['content']}")
+    for msg in messages:
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+        if role == "user":
+            console.print(f"\n[bold cyan]你[/bold cyan]")
+            console.print(content)
+        elif role == "assistant":
+            console.print(Rule(style="dim"))
+            console.print(f"[bold green]AI[/bold green]")
+            console.print(content)
+        elif role == "system":
+            console.print(f"\n[dim][System] {content[:80]}{'…' if len(content) > 80 else ''}[/dim]")
+        elif role == "tool":
+            console.print(f"\n[yellow][Tool][/yellow] {content[:120]}{'…' if len(content) > 120 else ''}")
 
 
 @_history_app.command("export", help="匯出對話為 Markdown")

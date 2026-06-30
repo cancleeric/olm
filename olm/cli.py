@@ -1038,3 +1038,10 @@ def _gw_list():
     console.print(Panel(t, title="[green bold]閘道 IP 白名單[/]", border_style="green"))
     gw_port = settings.gateway_port
     console.print(f"  [dim]重啟閘道後，白名單 IP 可存取 :{gw_port}，其餘回 403[/dim]")
+
+
+# ── serve-mcp ─────────────────────────────────────────────────
+@app.command("serve-mcp", help="以 MCP server 模式啟動（stdio JSON-RPC，供 Claude/Cursor 等 AI 工具連接）")
+def cmd_serve_mcp():
+    from .mcp_server import run_server
+    run_server()

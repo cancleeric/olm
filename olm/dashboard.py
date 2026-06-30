@@ -294,6 +294,142 @@ def _do_bench(client: OllamaClient, settings: Settings, model: str):
     console.print(f"  [dim]已記錄到歷史（olm bench --history 查看）[/dim]")
 
 
+def _estimate_kv_gb(model_name: str, num_ctx: int) -> float:
+    """粗估 KV cache 大小（GB），q4 量化模型用。
+    基準：7B 模型 32K context ≈ 0.5 GB KV cache。
+    """
+    import re
+    m = re.search(r'(\d+\.?\d*)\s*b', model_name.lower())
+    params_b = float(m.group(1)) if m else 7.0
+    # 7B @ 32K = 0.5 GB；線性 scale with params and context
+    return (params_b / 7.0) * 0.5 * (num_ctx / 32768)
+
+
+def _free_ram_gb() -> float:
+    """讀系統可用 RAM（GB）。"""
+    try:
+        _total, _used, free = _sysmem()
+        return (free or 0) / 1e9
+    except Exception:
+        return 0.0
+
+
+def _ctx_picker(current: int, model: str, free_ram_gb: float) -> Optional[int]:
+    """互動式 context 長度 picker（raw 模式 TUI）。回傳選定值或 None（取消）。"""
+    import sys
+    import io
+    import math
+    import select
+    import termios
+    import tty
+    from rich.panel import Panel as RPanel
+    from rich.console import Console as RConsole
+
+    PRESETS = [4096, 8192, 16384, 32768, 65536, 131072, 262144]
+    PRESET_LABELS = ["4K", "8K", "16K", "32K", "64K", "128K", "256K"]
+    MIN_CTX = 512
+    MAX_CTX = 1048576  # 1M
+
+    val = current
+
+    def _fmt_ctx(n: int) -> str:
+        if n >= 1024:
+            return f"{n // 1024}K ({n:,})"
+        return str(n)
+
+    def _render(v: int) -> str:
+        kv_gb = _estimate_kv_gb(model, v)
+        ok = kv_gb <= free_ram_gb * 0.8
+        ram_color = "green" if ok else "red"
+        ram_icon = "✓" if ok else "✗"
+
+        pct = math.log(max(v, 1)) / math.log(MAX_CTX)
+        bar_len = 30
+        filled = int(pct * bar_len)
+        bar = "█" * filled + "░" * (bar_len - filled)
+
+        preset_row = "  ".join(
+            f"[[bold]{i + 1}[/bold]]{PRESET_LABELS[i]}" for i in range(len(PRESETS))
+        )
+
+        content = (
+            f"[bold cyan]{_fmt_ctx(v)}[/bold cyan]\n\n"
+            f"[dim]◀ ←/- 減少 1K    增加 1K →/+ ▶    h/l 跳 8K[/dim]\n\n"
+            f"  [{bar}] {int(pct * 100)}%\n\n"
+            f"  KV Cache 預估：[bold]~{kv_gb:.2f} GB[/bold]\n"
+            f"  可用 RAM：[bold]{free_ram_gb:.1f} GB[/bold]  [{ram_color}]{ram_icon} "
+            f"{'可載入' if ok else '可能不足'}[/{ram_color}]\n\n"
+            f"  {preset_row}\n\n"
+            f"  [dim][Enter] 確認   [Esc/q] 取消[/dim]"
+        )
+
+        buf = io.StringIO()
+        rc = RConsole(file=buf, highlight=False)
+        rc.print(RPanel(content, title=f"[bold]Context Length — {model}[/bold]", border_style="cyan", width=60))
+        return buf.getvalue()
+
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    lines_printed = 0
+
+    def _clear_lines(n: int) -> None:
+        sys.stdout.write(f"\033[{n}A\033[J")
+        sys.stdout.flush()
+
+    def _print_panel() -> None:
+        nonlocal lines_printed
+        if lines_printed:
+            _clear_lines(lines_printed)
+        out = _render(val)
+        sys.stdout.write(out)
+        sys.stdout.flush()
+        lines_printed = out.count("\n") + 1
+
+    try:
+        tty.setraw(fd)
+        _print_panel()
+
+        while True:
+            ch = sys.stdin.read(1)
+
+            if ch in ("\r", "\n"):  # Enter
+                return val
+            elif ch in ("\x1b", "q"):
+                if ch == "\x1b":
+                    r, _, _ = select.select([sys.stdin], [], [], 0.05)
+                    if r:
+                        next1 = sys.stdin.read(1)
+                        if next1 == "[":
+                            r2, _, _ = select.select([sys.stdin], [], [], 0.05)
+                            if r2:
+                                arrow = sys.stdin.read(1)
+                                if arrow == "C":  # →
+                                    val = min(val + 1024, MAX_CTX)
+                                elif arrow == "D":  # ←
+                                    val = max(val - 1024, MIN_CTX)
+                                _print_panel()
+                                continue
+                return None
+            elif ch in ("+", "="):
+                val = min(val + 1024, MAX_CTX)
+            elif ch == "-":
+                val = max(val - 1024, MIN_CTX)
+            elif ch == "l":
+                val = min(val + 8192, MAX_CTX)
+            elif ch == "h":
+                val = max(val - 8192, MIN_CTX)
+            elif ch in "1234567":
+                val = PRESETS[int(ch) - 1]
+
+            _print_panel()
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+
+    return None
+
+
 def _do_chat_repl(
     client: OllamaClient,
     settings: Settings,
@@ -351,7 +487,22 @@ def _do_chat_repl(
             continue
         if user_input.startswith("/ctx"):
             parts = user_input.split()
-            if len(parts) == 2:
+            if len(parts) == 1:
+                # 無參數 → 開啟互動 picker
+                result = _ctx_picker(
+                    current=ctx_limit or 4096,
+                    model=model,
+                    free_ram_gb=_free_ram_gb(),
+                )
+                if result is not None:
+                    if options is None:
+                        options = {}
+                    options["num_ctx"] = result
+                    ctx_limit = result
+                    console.print(f"  [green]✓ Context 已設為 {result:,} tokens[/green]")
+                else:
+                    console.print("  [dim]取消，保持原設定[/dim]")
+            elif len(parts) == 2:
                 try:
                     val = parts[1].upper()
                     if val.endswith("K"):
